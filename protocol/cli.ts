@@ -30,8 +30,8 @@ import { addInstructions, INSTRUCTION_LINES, instructionsFile, instructionsOn, r
 import { brief, briefText } from "./brief";
 import { splitLine, whyLine } from "./blame";
 import { checkPrivateRemote, privateRemote, sync } from "./sync";
-import { catchUp } from "./catchup";
-import { checkForUpdate, codexDir, cursorDir, update, updateLine } from "./version";
+import { catchUp, earlierSessions } from "./catchup";
+import { anvcCommand, checkForUpdate, codexDir, cursorDir, installLauncher, launcherOnPath, update, updateLine } from "./version";
 import { allActivity, plural, readActivity, repoRoot } from "./activity";
 import { folders, setFolder } from "./folders";
 import { isLocalOnly, LOCAL_ONLY_REFUSAL, setLocalOnly } from "./localonly";
@@ -46,7 +46,7 @@ import { removeCommand, restoreCommand } from "./remove";
 import { clearProjectAssist, LEVELS, MOMENTS, readAssist, readEverywhere, writeAssist, type Level, type Moment } from "./assist";
 import { helped } from "./helped";
 import { exportPolicy, FIELDS, importPolicy, PRESETS, readPolicy, writeDefaults, writePolicy, type Choice, type RetireMode } from "./policy";
-import { options, optionsText } from "./options";
+import { compactOptions, options, optionsText } from "./options";
 import { ruleCommand } from "./rules";
 import { currentNotes, inventory, toolsText, writeNote } from "./tools";
 import { sourcesSection, sourceTool } from "./sources";
@@ -59,6 +59,9 @@ const has = (name: string) => argHas(argv, name);
 const repo = resolve(flag("repo", process.cwd()));
 // Everything after the subcommand that is not a flag: the search term.
 const positional = positionals(argv).slice(1);
+
+/** What a tool that takes no search term looks at, for `anvc activity`. */
+const LOOKED_AT: Record<string, string> = { anvc_dead_ends: "open dead ends", anvc_failed: "failed attempts", anvc_red_to_green: "attempts that turned tests green" };
 
 function show(hits: Hit[]) {
   if (!hits.length) { console.log("no records"); return; }
@@ -104,8 +107,11 @@ switch (command) {
     break;
   }
   case "options": {
+    // Setup starts here, in the plugin, so this is where the anvc command is
+    // put on the PATH, and the commands below can use it.
+    installLauncher();
     const o = options(settingFor(), process.cwd());
-    console.log(has("json") ? JSON.stringify(o, null, 2) : optionsText(o));
+    console.log(has("json") ? JSON.stringify(compactOptions(o, anvcCommand(), o.repo ? earlierSessions(o.repo) : 0)) : optionsText(o));
     break;
   }
   case "data": {
@@ -589,7 +595,7 @@ switch (command) {
       : `  no secrets found in them`);
     console.log(`\nnew records go to: ${f.default}${f.default === "shared" ? "   (anvc policy tier private to change)" : ""}`);
     if (!f.pushConfigured) {
-      console.log(`\ngit push will not carry shared records here yet. Run: bun run anvc init --repo ${repo}`);
+      console.log(`\ngit push will not carry shared records here yet. Run: ${anvcCommand()} init --repo ${shellWord(repo)}`);
     }
     break;
   }
@@ -858,7 +864,10 @@ switch (command) {
     if (!rows.length) { console.log("Nothing yet. anvc logs here once hooks and the MCP server run in a session."); break; }
     for (const r of rows.slice(-limit)) {
       const when = r.ts.slice(5, 16).replace("T", " ");
-      const what = r.kind === "searched" ? `"${r.query ?? ""}" → ${r.hits ?? 0} hit${r.hits === 1 ? "" : "s"}`
+      const what = r.kind === "searched" ? r.query
+        ? `"${r.query}" → ${r.hits ?? 0} hit${r.hits === 1 ? "" : "s"}`
+        // A tool that takes no search term: say what it looked at.
+        : `${LOOKED_AT[r.via ?? ""] ?? (r.via ?? "records").replace(/^anvc_/, "").replace(/_/g, " ")} → ${r.hits ?? 0} found`
         : r.kind === "recorded" ? `${r.outcome} · ${r.tier} · ${r.titles?.[0] ?? ""}`
           : r.kind === "feedback" ? `${r.verdict} on ${r.records?.[0] ?? ""}`
             : r.kind === "retired" ? `${r.outcome} ${r.records?.[0] ?? ""} (${r.verdict})`
@@ -898,7 +907,7 @@ switch (command) {
   }
   default:
     console.log(`anvc — checkpoint records
-
+${launcherOnPath() ? "" : `\n  anvc isn't on your PATH, so run these as: ${anvcCommand()} <command>\n`}
   anvc options [--json]                    every setting, what it is now, and the command that changes it
   anvc on | off                            turn ANVC on or off in this repository
   anvc local [on|off]                      keep everything ANVC saves here on this computer (--everywhere for every project)

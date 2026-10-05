@@ -205,27 +205,93 @@ function Version() {
   );
 }
 
+/** What /api/start answers: the agents with ANVC's hooks here, and the sessions from before to import. */
+interface Start { agents: string[]; earlier: number }
+
+/**
+ * The work log with nothing in it. It used to say "Connect an agent" even
+ * with an agent connected, and an agent sent to fix that debugged a
+ * connection that worked. It says which of three it is: ANVC is off, no
+ * agent is connected, or one is and has saved nothing yet. In the last two
+ * it offers to import the sessions from before ANVC was on.
+ */
 function Welcome({
+  on,
+  again,
+  onTurnOn,
   onSetup,
   onExample,
+  onImported,
 }: {
+  /** Null until the folder list arrives. */
+  on: boolean | null;
+  /** Read again when this changes: the setup dialog closing can connect an agent. */
+  again: unknown;
+  onTurnOn: () => void;
   onSetup: () => void;
   onExample: () => void;
+  onImported: () => void;
 }) {
+  const [start, setStart] = useState<Start | null>(null);
+  const [importing, setImporting] = useState(false);
+  const [said, setSaid] = useState("");
+  useEffect(() => { void getJson<Start>("/api/start").then(setStart).catch(() => {}); }, [again]);
+
+  const importEarlier = async () => {
+    setImporting(true);
+    try {
+      const done = await (await send("/api/start", {})).json() as { written?: number; sessions?: number; error?: string };
+      if (done.error) setSaid(`Couldn't import: ${done.error}`);
+      else if (done.written) { setSaid(`Imported ${plural(done.written, "record")} from ${plural(done.sessions ?? 0, "session")}.`); onImported(); }
+      else setSaid("Those sessions had nothing to import.");
+      void getJson<Start>("/api/start").then(setStart).catch(() => {});
+    } catch {
+      setSaid("Couldn't reach the ANVC server.");
+    } finally {
+      setImporting(false);
+    }
+  };
+
+  const example = (
+    <button class="button" onClick={onExample}>
+      View example
+      <Icon name="arrow-right" />
+    </button>
+  );
+  if (on === false) return (
+    <div class="welcome">
+      <h2>ANVC is off for this project</h2>
+      <p>Nothing is saved here or shown to agents.</p>
+      <div class="welcome-actions">
+        <button class="button primary" onClick={onTurnOn}>Turn on</button>
+        {example}
+      </div>
+    </div>
+  );
+  // Nothing more is said until the server answers, so it never says the wrong one first.
+  const connected = start && start.agents.length > 0;
+  const earlier = start?.earlier ? (
+    <button class={`button${connected ? " primary" : ""}`} onClick={importEarlier} disabled={importing}>
+      {importing ? "Importing…" : `Import ${plural(start.earlier, "earlier session")}`}
+    </button>
+  ) : null;
   return (
     <div class="welcome">
       <h2>Nothing recorded yet</h2>
-      <p>Connect an agent to start.</p>
-      <div class="welcome-actions">
-        <button class="button primary" onClick={onSetup}>
-          <Icon name="plus" />
-          Connect an agent
-        </button>
-        <button class="button" onClick={onExample}>
-          View example
-          <Icon name="arrow-right" />
-        </button>
-      </div>
+      {start && <p>{connected ? "ANVC is on. Records appear here when your agent saves its work or a session ends." : "Connect an agent to start."}</p>}
+      {start && (
+        <div class="welcome-actions">
+          {!connected && (
+            <button class="button primary" onClick={onSetup}>
+              <Icon name="plus" />
+              Connect an agent
+            </button>
+          )}
+          {earlier}
+          {example}
+        </div>
+      )}
+      {said && <p class="welcome-said" role="status">{said}</p>}
     </div>
   );
 }
@@ -873,7 +939,7 @@ function App() {
               </span>
             )}
           </div>
-          {page === "work" && !example && <OffBanner folders={folderState} />}
+          {page === "work" && !example && !(loaded && !data.turns.length) && <OffBanner folders={folderState} />}
           {page === "work" && !example && !session && loaded && <HelpedBlock />}
           {page === "folders" && <FoldersPage folders={folderState} />}
           {page === "results" && <ResultsHub />}
@@ -1003,8 +1069,12 @@ function App() {
           )}
           {page === "work" && !example && loaded && !data.turns.length && (
             <Welcome
+              on={folderState.here?.on ?? null}
+              again={setup}
+              onTurnOn={() => folderState.here && void folderState.set(folderState.here.repo, true)}
               onSetup={() => setSetup(true)}
               onExample={() => switchExample(true)}
+              onImported={load}
             />
           )}
         </main>

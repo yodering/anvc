@@ -35,6 +35,7 @@ import { existsSync, readFileSync, statSync } from "node:fs";
 import { TOOL_TOOLS, toolTool } from "./tools";
 import { ALONGSIDE, STATUS_TOOLS, statusTool } from "./status";
 import { openWorkLog } from "./open";
+import { anvcCommand } from "./version";
 import { SOURCE_TOOLS, sourcesSection, sourceTool } from "./sources";
 
 /**
@@ -469,7 +470,7 @@ async function openTool(): Promise<string> {
     const o = await openWorkLog(repo);
     return o.browser
       ? `Opened the work log for ${o.repo} in the browser, at ${o.url}.`
-      : `The work log for ${o.repo} is on ${o.url}. There's no display here to open it on. For a link that signs in, the person can run anvc open --no-browser in a terminal.`;
+      : `The work log for ${o.repo} is on ${o.url}. There's no display here to open it on. For a link that signs in, the person can run ${anvcCommand()} open --no-browser in a terminal.`;
   } catch (error) { return error instanceof Error ? error.message : String(error); }
 }
 
@@ -643,7 +644,7 @@ function callTool(name: string, args: Record<string, unknown>): string {
       return `recorded verdict "${verdict}" on ${target || "(no record named)"} at ${ref}\n  id: ${record.id}`;
     }
     case "anvc_result": {
-      if (dataMode(repo).mode === "off") return "Keeping track of results is off for this project. The person can turn it on in Settings or with: anvc data results";
+      if (dataMode(repo).mode === "off") return `Keeping track of results is off for this project. The person can turn it on in Settings or with: ${anvcCommand()} data results`;
       const actor = { kind: "agent" as const, agent: agentName, session: runId() };
       const status = typeof args.status === "string" ? args.status as ResultStatus : undefined;
       if (typeof args.of === "string" && args.of) {
@@ -651,7 +652,7 @@ function callTool(name: string, args: Record<string, unknown>): string {
         recordStatus(repo, args.of, status, String(args.why ?? ""), actor);
         const view = listResults(repo).find((r) => r.id === args.of)!;
         return view.proposed
-          ? `Proposed marking ${view.name} ${status}. It is ${view.status} until the person decides: anvc result ${status === "locked" ? "lock" : status} ${view.id}`
+          ? `Proposed marking ${view.name} ${status}. It is ${view.status} until the person decides: ${anvcCommand()} result ${status === "locked" ? "lock" : status} ${view.id}`
           : `${view.name} is now ${view.status}.`;
       }
       const strings = (x: unknown) => (Array.isArray(x) ? x.filter((v): v is string => typeof v === "string") : undefined);
@@ -749,8 +750,8 @@ function callTool(name: string, args: Record<string, unknown>): string {
         ...(args.by ? { by: String(args.by) } : {}), session: runId(), agent: agentName,
       }));
       const said = result.state === "retired"
-        ? `Retired ${String(args.record)}. It is no longer shown to agents. The person can restore it with: anvc retire restore ${String(args.record)}`
-        : `Proposed retiring ${String(args.record)}. Nothing changes until the person approves it with: anvc retire approve ${String(args.record)}\nTell them you proposed it and why.`;
+        ? `Retired ${String(args.record)}. It is no longer shown to agents. The person can restore it with: ${anvcCommand()} retire restore ${String(args.record)}`
+        : `Proposed retiring ${String(args.record)}. Nothing changes until the person approves it with: ${anvcCommand()} retire approve ${String(args.record)}\nTell them you proposed it and why.`;
       return `${said}\n  ${result.checked}\n  decision id: ${result.id} (${result.tier})`;
     }
     case "anvc_checkpoint": {

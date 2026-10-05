@@ -6,7 +6,7 @@ import { expect, test } from "bun:test";
 import { copyFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
-import { checkForUpdate, desktopFile, hooksBehind, HOOKS_REVISION, installs, newestTag, noteInstall, pullUpdate, readUpdate, updateLine, updateOffer, updatePlugin, version } from "../protocol/version";
+import { anvcCommand, checkForUpdate, desktopFile, hooksBehind, HOOKS_REVISION, installs, newestTag, noteInstall, pullUpdate, readUpdate, updateLine, updateOffer, updatePlugin, version } from "../protocol/version";
 import { writeJson } from "../protocol/rawlog";
 import { git, setEnv, tmp } from "./helpers";
 
@@ -36,7 +36,7 @@ test("a copy that fell behind says how far, and pulling brings it level", async 
   const state = checkForUpdate(copy);
   expect(state.behind).toBe(2);
   expect(state.changes).toEqual(["Read a Codex command's exit code", "Show why under every attempt"]);
-  expect(updateLine(state)).toBe("ANVC has 2 updates ready. Run: bun run anvc update");
+  expect(updateLine(state)).toBe(`ANVC has 2 updates ready. Run: ${anvcCommand()} update`);
   const pulled = pullUpdate(copy);
   expect(pulled.changes).toHaveLength(2);
   expect(checkForUpdate(copy).behind).toBe(0);

@@ -8,6 +8,7 @@ import { join } from "node:path";
 import { shellWord } from "../protocol/args";
 import { folderOn, folders, setFolder } from "../protocol/folders";
 import { addFolder, findRepos, foundView, searchFolders } from "../protocol/found";
+import { anvcCommand } from "../protocol/version";
 import { setEnv, tmp } from "./helpers";
 
 // `~` in a folder the person adds isn't tested here: os.homedir() keeps the
@@ -99,7 +100,7 @@ test("what a repository needs follows how ANVC is installed", () => {
   const desktop = foundView(known, false);
   expect(desktop.setup).toBe(false);
   expect(desktop.commands.everywhere).toBe("bun run setup --global --agent cursor");
-  expect(desktop.commands.remove).toBe("bun run anvc uninstall --everywhere");
+  expect(desktop.commands.remove).toBe(`${anvcCommand()} uninstall --everywhere`);
 });
 
 test("switching a found repository keeps it off the list of folders ANVC has run in", () => {

@@ -15,13 +15,13 @@
  */
 import pkg from "../package.json" with { type: "json" };
 import { spawn } from "node:child_process";
-import { existsSync, readFileSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { delimiter, join, resolve } from "node:path";
+import { delimiter, dirname, join, resolve } from "node:path";
 import { shellWord } from "./args";
 import { gitOrNull } from "./git";
-import { RELEASES } from "./desktop";
-import { isRepo, readJson, writeJson } from "./rawlog";
+import { RELEASES, which } from "./desktop";
+import { isRepo, readHead, readJson, samePath, writeJson } from "./rawlog";
 
 /** Where this copy of anvc lives: the folder hooks and the MCP server run from. */
 export const HOME = resolve(import.meta.dir, "..");
@@ -79,6 +79,120 @@ const BUILT: string = pkg.version;
  */
 export const managedBy = (): "git" | "plugin" | "desktop" =>
   Bun.isStandaloneExecutable ? "desktop" : existsSync(join(HOME, ".git")) ? "git" : "plugin";
+
+/**
+ * The `anvc` command. The plugin runs from a folder named for its version,
+ * such as ~/.claude/plugins/cache/anvc/anvc/0.4.9, so every command that
+ * named it stopped working at the next update. The launcher names no
+ * version: it runs the command line written in ~/.anvc/cli, which each
+ * session start and each setup point at the copy running them.
+ *
+ * It goes in ~/.local/bin when that's on the PATH, and otherwise where Bun
+ * keeps the commands it installs. Bun's installer puts that folder on the
+ * PATH on every system, and ANVC needs Bun, where macOS often has no
+ * ~/.local/bin on it. On Windows it is anvc.cmd for cmd.exe and PowerShell,
+ * and an sh script beside it for Git Bash, where Claude Code runs commands and
+ * a .cmd isn't found by its bare name. ANVC_BIN_DIR moves it, which the tests
+ * do.
+ */
+const LAUNCHER_MARK = "anvc-launcher";
+const LAUNCHERS = process.platform === "win32" ? ["anvc.cmd", "anvc"] : ["anvc"];
+
+/** The file that names the command line the launcher runs. */
+export const pointerFile = (): string => join(stateHome(), "cli");
+
+/**
+ * The folder the launcher goes in: ~/.local/bin if it's on the PATH, else
+ * Bun's if it's there and on the PATH. With neither, the launcher still goes
+ * in ~/.local/bin, or Bun's folder on Windows, and commands name the command
+ * line by its path.
+ */
+export function binDir(): string {
+  const [local, bun] = binDirs();
+  if (!bun) return local!;
+  const path = new Set((process.env.PATH ?? "").split(delimiter).filter(Boolean).map((d) => samePath(d)));
+  if (path.has(samePath(local!))) return local!;
+  if (existsSync(bun) && path.has(samePath(bun))) return bun;
+  return process.platform === "win32" ? bun : local!;
+}
+
+/** The folders the launcher can be in: ~/.local/bin and Bun's, or ANVC_BIN_DIR alone. */
+const binDirs = (): string[] => process.env.ANVC_BIN_DIR ? [process.env.ANVC_BIN_DIR]
+  : [join(homedir(), ".local", "bin"), join(process.env.BUN_INSTALL || join(homedir(), ".bun"), "bin")];
+
+/** Whether a file is the launcher ANVC wrote, and not another program called anvc. */
+const ours = (file: string): boolean => readHead(file, 512)?.includes(LAUNCHER_MARK) ?? false;
+
+function launcherScript(name: string, pointer: string): string {
+  const missing = `anvc: the ANVC command line named in ${pointer} isn't there. Start a new agent session, and it's named again.`;
+  // cmd.exe reads & | < > ^ in an echo as its own, so each gets a caret.
+  return name.endsWith(".cmd")
+    ? [`@echo off`, `rem ${LAUNCHER_MARK}: runs the ANVC command line named in the file below, which ANVC keeps current.`, `setlocal`,
+      `set /p ANVC_CLI=<"${pointer}"`, `if exist "%ANVC_CLI%" goto run`, `echo ${missing.replace(/[&|<>^]/g, "^$&")} 1>&2`, `exit /b 1`,
+      `:run`, `bun "%ANVC_CLI%" %*`, ``].join("\r\n")
+    : [`#!/bin/sh`, `# ${LAUNCHER_MARK}: runs the ANVC command line named in the file below, which ANVC keeps current.`,
+      `cli=$(cat ${shellWord(pointer)} 2>/dev/null)`, `if [ ! -f "$cli" ]; then`, `  echo ${shellWord(missing)} >&2`, `  exit 1`, `fi`, `exec bun "$cli" "$@"`, ``].join("\n");
+}
+
+/**
+ * Points the launcher at this copy's command line. Session starts call it, so
+ * after an update the launcher runs the new version.
+ */
+export function notePointer(): void {
+  // Compiled into the desktop app, there is no command line to point at.
+  if (managedBy() === "desktop") return;
+  try {
+    const file = pointerFile();
+    if (readHead(file, 4096) === CLI) return;
+    mkdirSync(dirname(file), { recursive: true });
+    writeFileSync(file, CLI);
+  } catch { /* the launcher runs the copy it ran before */ }
+}
+
+/**
+ * Puts the launcher in binDir(), and points it at this copy. Setup, `anvc
+ * options` and each session start call this. Writing it took 0.5 ms, and a
+ * call that finds it current 0.013 ms. An `anvc` on the PATH that ANVC didn't
+ * write is left alone, and then no launcher is added. Returns the launcher's
+ * path and whether it was written, or would be in a dry run, or null when
+ * there is no launcher.
+ */
+export function installLauncher(dry = false): { file: string; changed: boolean } | null {
+  if (managedBy() === "desktop") return null;
+  if (!dry) notePointer();
+  try {
+    const dir = binDir();
+    const found = which("anvc");
+    if (found && !ours(found)) return null;
+    const files = LAUNCHERS.map((name) => ({ file: join(dir, name), script: launcherScript(name, pointerFile()) }));
+    if (files.some((f) => existsSync(f.file) && !ours(f.file))) return null;
+    const stale = files.filter((f) => !existsSync(f.file) || readFileSync(f.file, "utf8") !== f.script);
+    if (stale.length && !dry) {
+      mkdirSync(dir, { recursive: true });
+      for (const f of stale) writeFileSync(f.file, f.script, { mode: 0o755 });
+    }
+    return { file: files[0]!.file, changed: stale.length > 0 };
+  } catch { return null; }
+}
+
+/**
+ * Whether `anvc` on the PATH is a launcher ANVC wrote, in either of its
+ * folders. It can be in the one binDir() doesn't choose: one written to Bun's
+ * folder stays there after ~/.local/bin joins the PATH, and it works the same.
+ */
+export function launcherOnPath(): boolean {
+  const found = which("anvc");
+  return found !== null && binDirs().some((d) => samePath(d) === samePath(dirname(found))) && ours(found);
+}
+
+/**
+ * The command that starts ANVC, for every command shown to a person or an
+ * agent: `anvc` while the launcher is on the PATH, else this copy's command
+ * line by its path. The desktop app has none of its own, so there the
+ * command runs in the clone it was built from.
+ */
+export const anvcCommand = (): string =>
+  launcherOnPath() ? "anvc" : managedBy() === "desktop" ? "bun run anvc" : `bun ${shellWord(CLI)}`;
 
 export interface Install { repo: string; agent: string; hooks: number; ts: string }
 
@@ -209,7 +323,7 @@ export function updateLine(state: UpdateState | null): string | null {
     return `ANVC ${state.latest} is out, and this is ${version()}. To update, run in a terminal: claude plugin marketplace update anvc && claude plugin update anvc@anvc, then start a new session.`;
   }
   if (!state || !state.behind) return null;
-  return `ANVC has ${state.behind} update${state.behind === 1 ? "" : "s"} ready. Run: bun run anvc update`;
+  return `ANVC has ${state.behind} update${state.behind === 1 ? "" : "s"} ready. Run: ${anvcCommand()} update`;
 }
 
 /** Where the desktop app says which version it is, each time it starts. */
@@ -229,7 +343,7 @@ export function updateOffer(state: UpdateState | null): { text: string; said: ()
   const desktop = readJson<{ version?: string }>(desktopFile(), {}).version;
   const steps = [
     Bun.semver.order(latest, version()) > 0 ? "`claude plugin marketplace update anvc && claude plugin update anvc@anvc`, after which they start a new session" : null,
-    desktop && Bun.semver.order(latest, desktop) > 0 ? `\`bun ${shellWord(CLI)} desktop install\` for the desktop app, which is ${desktop}` : null,
+    desktop && Bun.semver.order(latest, desktop) > 0 ? `\`${anvcCommand()} desktop install\` for the desktop app, which is ${desktop}` : null,
   ].filter(Boolean);
   if (!steps.length) return null;
   return {

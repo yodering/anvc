@@ -25,7 +25,7 @@ import { existsSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { flag } from "../protocol/args";
 import { AGENTS } from "../protocol/agents";
-import { claudeDir, codexDir, cursorDir, GLOBAL, installs, noteInstall, forgetInstall } from "../protocol/version";
+import { anvcCommand, claudeDir, codexDir, cursorDir, GLOBAL, installLauncher, installs, noteInstall, forgetInstall } from "../protocol/version";
 import { codexHooks, cursorHooks, dropServer, installedAgents, mergeCursorHooks, mergeHooks, planner, readJsonOrExit, removeOurs } from "./hookfiles";
 
 const argv = process.argv.slice(2);
@@ -43,7 +43,7 @@ Nothing was changed.`);
   process.exit(2);
 }
 
-const { dry, say, save, done } = planner(argv);
+const { dry, say, plan, save, done } = planner(argv);
 
 say("ANVC setup for every repository\n");
 if (dry) console.log("Setup would change, for every repository:");
@@ -110,12 +110,16 @@ for (const agent of agents) {
   if (!dry) noteInstall(GLOBAL, agent);
 }
 
+const launcher = installLauncher(dry);
+if (launcher?.changed) dry ? plan(launcher.file, "add a launcher that runs ANVC from any folder") : say(`✓ Added ${launcher.file}, which runs ANVC from any folder`);
+const cli = anvcCommand();
+
 done();
 say(`
 ANVC now runs in every git repository these agents open. To turn it off in one:
-  bun run anvc off --repo /path/to/project     or the switch at the top of the work log
+  ${cli} off --repo /path/to/project     or the switch at the top of the work log
 
 Records stay on this computer. To share a repository's records with git push, run
-this once in it:  bun run anvc init --repo /path/to/project
+this once in it:  ${cli} init --repo /path/to/project
 
 Start a new agent session for this to take effect.`);

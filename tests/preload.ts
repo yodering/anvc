@@ -23,6 +23,8 @@ process.env.ANVC_STATE_DIR ??= join(scratch, "state");
 process.env.ANVC_CAPTURE_DIR ??= join(scratch, "capture");
 process.env.ANVC_KEPT_DIR ??= join(scratch, "transcripts");
 process.env.ANVC_STATE_HOME ??= join(scratch, "home");
+// Setup and `anvc options` put the anvc command in ~/.local/bin otherwise.
+process.env.ANVC_BIN_DIR ??= join(scratch, "bin");
 process.env.ANVC_NO_UPDATE_NOTICE ??= "1";
 // And out of the real ~/.claude, for anything that runs Claude Code's CLI.
 process.env.CLAUDE_CONFIG_DIR ??= join(scratch, "claude");

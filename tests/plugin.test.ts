@@ -11,6 +11,7 @@ import { appendRecord, ulid, type CheckpointRecord } from "../protocol/record";
 import { recordFile, type Running } from "../protocol/open";
 import { readJson } from "../protocol/rawlog";
 import { shellWord } from "../protocol/args";
+import { pointerFile } from "../protocol/version";
 import { gitRepo, runHook, tmp, uiFetch } from "./helpers";
 
 const BUILD = resolve(import.meta.dir, "../scripts/build-plugin.ts");
@@ -36,15 +37,24 @@ test("the plugin carries every hook setup installs, and its bundled hooks run on
   const cli = join(out, "dist/cli.js");
   const options = JSON.parse(Bun.spawnSync(["bun", cli, "options", "--json", "--repo", repo], { stdout: "pipe" }).stdout.toString());
   const setting = (key: string) => options.settings.find((s: { key: string }) => s.key === key);
-  expect(setting("assist").choices[0].set).toContain(`${shellWord(cli)} assist`);
+  // The anvc command isn't on this PATH, so the commands start with the bundle's path.
+  expect(options.cli).toBe(`bun ${shellWord(cli)}`);
+  expect(setting("assist").set).toStartWith(`bun ${shellWord(cli)} assist <value>`);
   expect(options.settings.map((s: { key: string }) => s.key)).not.toContain("agents");
   for (const key of ["prepush", "instructions"]) {
-    expect(setting(key).choices.map((c: { set: string }) => c.set.split(" ").slice(1, 4).join(" ")), key)
-      .toEqual([`${shellWord(cli)} ${key === "prepush" ? "push-check" : "instructions"} on`, `${shellWord(cli)} ${key === "prepush" ? "push-check" : "instructions"} off`]);
+    expect(setting(key).set, key).toStartWith(`bun ${shellWord(cli)} ${key === "prepush" ? "push-check" : "instructions"} <value>`);
   }
+  // The setup skill fills in the commands it runs from the list.
+  for (const step of ["`<cli> catch-up`", "`<cli> desktop install`", "`<value>`"]) expect(setup).toContain(step);
+  expect(setup).not.toContain("setEverywhere");
+  // After the settings, importing the earlier sessions is the next question, on its own.
+  expect(setup).toContain("Next, if `earlier` is more than 0, ask one short question before anything else");
+  expect(setup.indexOf("`<cli> catch-up`")).toBeLessThan(setup.indexOf("Then offer these"));
   expect(Bun.spawnSync(["bun", cli, "push-check", "on", "--repo", repo]).exitCode).toBe(0);
-  // The hook runs the bundle, since a plugin has no protocol/cli.ts.
-  expect(await Bun.file(join(repo, ".git/hooks/pre-push")).text()).toContain(`${quoted(cli)} pre-push`);
+  // The hook runs the command line named in ~/.anvc/cli, which names the
+  // bundle, since a plugin has no protocol/cli.ts.
+  expect(await Bun.file(join(repo, ".git/hooks/pre-push")).text()).toContain(`cat ${quoted(pointerFile())}`);
+  expect(await Bun.file(pointerFile()).text()).toBe(cli);
   expect(Bun.spawnSync(["bun", cli, "push-check", "off", "--repo", repo]).exitCode).toBe(0);
   expect(await Bun.file(join(repo, ".git/hooks/pre-push")).exists()).toBe(false);
 

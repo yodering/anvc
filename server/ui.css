@@ -890,6 +890,9 @@ kbd {
   justify-content: center;
   gap: 9px;
 }
+.welcome > p.welcome-said {
+  margin: 18px auto 0;
+}
 .example-banner,
 .error-banner {
   padding: 8px 28px;

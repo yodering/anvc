@@ -2,8 +2,8 @@
 // @bun
 
 // emitters/claude-code/capture.ts
-import { appendFileSync as appendFileSync6, mkdirSync as mkdirSync13 } from "fs";
-import { dirname as dirname9, resolve as resolve6 } from "path";
+import { appendFileSync as appendFileSync6, mkdirSync as mkdirSync14 } from "fs";
+import { dirname as dirname10, resolve as resolve6 } from "path";
 
 // protocol/rawlog.ts
 import { closeSync, fstatSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, realpathSync, writeFileSync } from "fs";
@@ -525,7 +525,7 @@ function setLocalOnly(repo, on) {
 // package.json
 var package_default = {
   name: "anvc",
-  version: "0.4.9",
+  version: "0.4.10",
   private: true,
   type: "module",
   scripts: {
@@ -563,9 +563,9 @@ var package_default = {
 
 // protocol/version.ts
 import { spawn } from "child_process";
-import { existsSync as existsSync3, readFileSync as readFileSync2, statSync } from "fs";
+import { existsSync as existsSync3, mkdirSync as mkdirSync5, readFileSync as readFileSync2, statSync, writeFileSync as writeFileSync4 } from "fs";
 import { homedir as homedir4 } from "os";
-import { delimiter, join as join5, resolve as resolve2 } from "path";
+import { delimiter, dirname as dirname5, join as join5, resolve as resolve2 } from "path";
 
 // protocol/args.ts
 function flag(argv, name, fallback) {
@@ -738,6 +738,89 @@ function version() {
 }
 var BUILT = package_default.version;
 var managedBy = () => Bun.isStandaloneExecutable ? "desktop" : existsSync3(join5(HOME, ".git")) ? "git" : "plugin";
+var LAUNCHER_MARK = "anvc-launcher";
+var LAUNCHERS = process.platform === "win32" ? ["anvc.cmd", "anvc"] : ["anvc"];
+var pointerFile = () => join5(stateHome(), "cli");
+function binDir() {
+  const [local, bun] = binDirs();
+  if (!bun)
+    return local;
+  const path = new Set((process.env.PATH ?? "").split(delimiter).filter(Boolean).map((d) => samePath(d)));
+  if (path.has(samePath(local)))
+    return local;
+  if (existsSync3(bun) && path.has(samePath(bun)))
+    return bun;
+  return process.platform === "win32" ? bun : local;
+}
+var binDirs = () => process.env.ANVC_BIN_DIR ? [process.env.ANVC_BIN_DIR] : [join5(homedir4(), ".local", "bin"), join5(process.env.BUN_INSTALL || join5(homedir4(), ".bun"), "bin")];
+var ours = (file) => readHead(file, 512)?.includes(LAUNCHER_MARK) ?? false;
+function launcherScript(name, pointer) {
+  const missing = `anvc: the ANVC command line named in ${pointer} isn't there. Start a new agent session, and it's named again.`;
+  return name.endsWith(".cmd") ? [
+    `@echo off`,
+    `rem ${LAUNCHER_MARK}: runs the ANVC command line named in the file below, which ANVC keeps current.`,
+    `setlocal`,
+    `set /p ANVC_CLI=<"${pointer}"`,
+    `if exist "%ANVC_CLI%" goto run`,
+    `echo ${missing.replace(/[&|<>^]/g, "^$&")} 1>&2`,
+    `exit /b 1`,
+    `:run`,
+    `bun "%ANVC_CLI%" %*`,
+    ``
+  ].join(`\r
+`) : [
+    `#!/bin/sh`,
+    `# ${LAUNCHER_MARK}: runs the ANVC command line named in the file below, which ANVC keeps current.`,
+    `cli=$(cat ${shellWord(pointer)} 2>/dev/null)`,
+    `if [ ! -f "$cli" ]; then`,
+    `  echo ${shellWord(missing)} >&2`,
+    `  exit 1`,
+    `fi`,
+    `exec bun "$cli" "$@"`,
+    ``
+  ].join(`
+`);
+}
+function notePointer() {
+  if (managedBy() === "desktop")
+    return;
+  try {
+    const file = pointerFile();
+    if (readHead(file, 4096) === CLI)
+      return;
+    mkdirSync5(dirname5(file), { recursive: true });
+    writeFileSync4(file, CLI);
+  } catch {}
+}
+function installLauncher(dry = false) {
+  if (managedBy() === "desktop")
+    return null;
+  if (!dry)
+    notePointer();
+  try {
+    const dir = binDir();
+    const found = which("anvc");
+    if (found && !ours(found))
+      return null;
+    const files = LAUNCHERS.map((name) => ({ file: join5(dir, name), script: launcherScript(name, pointerFile()) }));
+    if (files.some((f) => existsSync3(f.file) && !ours(f.file)))
+      return null;
+    const stale = files.filter((f) => !existsSync3(f.file) || readFileSync2(f.file, "utf8") !== f.script);
+    if (stale.length && !dry) {
+      mkdirSync5(dir, { recursive: true });
+      for (const f of stale)
+        writeFileSync4(f.file, f.script, { mode: 493 });
+    }
+    return { file: files[0].file, changed: stale.length > 0 };
+  } catch {
+    return null;
+  }
+}
+function launcherOnPath() {
+  const found = which("anvc");
+  return found !== null && binDirs().some((d) => samePath(d) === samePath(dirname5(found))) && ours(found);
+}
+var anvcCommand = () => launcherOnPath() ? "anvc" : managedBy() === "desktop" ? "bun run anvc" : `bun ${shellWord(CLI)}`;
 var GLOBAL = "*";
 var installsFile = () => join5(stateHome(), "installs.json");
 var installs = () => readJson(installsFile(), []);
@@ -823,7 +906,7 @@ function updateLine(state) {
   }
   if (!state || !state.behind)
     return null;
-  return `ANVC has ${state.behind} update${state.behind === 1 ? "" : "s"} ready. Run: bun run anvc update`;
+  return `ANVC has ${state.behind} update${state.behind === 1 ? "" : "s"} ready. Run: ${anvcCommand()} update`;
 }
 var desktopFile = () => join5(stateHome(), "desktop.json");
 function updateOffer(state) {
@@ -836,7 +919,7 @@ function updateOffer(state) {
   const desktop = readJson(desktopFile(), {}).version;
   const steps = [
     Bun.semver.order(latest, version()) > 0 ? "`claude plugin marketplace update anvc && claude plugin update anvc@anvc`, after which they start a new session" : null,
-    desktop && Bun.semver.order(latest, desktop) > 0 ? `\`bun ${shellWord(CLI)} desktop install\` for the desktop app, which is ${desktop}` : null
+    desktop && Bun.semver.order(latest, desktop) > 0 ? `\`${anvcCommand()} desktop install\` for the desktop app, which is ${desktop}` : null
   ].filter(Boolean);
   if (!steps.length)
     return null;
@@ -1141,8 +1224,8 @@ function folders() {
 
 // protocol/results.ts
 import { createHash as createHash3 } from "crypto";
-import { closeSync as closeSync2, lstatSync, mkdirSync as mkdirSync6, openSync as openSync2, readdirSync as readdirSync2, readFileSync as readFileSync4, readSync as readSync2, rmSync as rmSync3, statSync as statSync3, writeFileSync as writeFileSync4 } from "fs";
-import { dirname as dirname6, join as join9, resolve as resolve4 } from "path";
+import { closeSync as closeSync2, lstatSync, mkdirSync as mkdirSync7, openSync as openSync2, readdirSync as readdirSync2, readFileSync as readFileSync4, readSync as readSync2, rmSync as rmSync3, statSync as statSync3, writeFileSync as writeFileSync5 } from "fs";
+import { dirname as dirname7, join as join9, resolve as resolve4 } from "path";
 
 // protocol/record.ts
 import { spawnSync as spawnSync2 } from "child_process";
@@ -2530,8 +2613,8 @@ function runFiles(command, cwd, repo) {
 }
 
 // protocol/runlog.ts
-import { appendFileSync as appendFileSync2, mkdirSync as mkdirSync5 } from "fs";
-import { dirname as dirname5, join as join8 } from "path";
+import { appendFileSync as appendFileSync2, mkdirSync as mkdirSync6 } from "fs";
+import { dirname as dirname6, join as join8 } from "path";
 var runsDir = (repo) => join8(captureRoot(), "runs", repoKey(repo));
 var runsFiles = (repo) => jsonl(runsDir(repo));
 
@@ -2623,7 +2706,7 @@ async function trackRun(command, cwd = process.cwd()) {
     } catch {}
   }
   const file = join8(runsDir(repo), `${row.ts.toString().slice(0, 10)}.jsonl`);
-  mkdirSync5(dirname5(file), { recursive: true, mode: 448 });
+  mkdirSync6(dirname6(file), { recursive: true, mode: 448 });
   appendFileSync2(file, `${JSON.stringify(row)}
 `, { mode: 384 });
   return { code, logged: true, files };
@@ -2719,8 +2802,8 @@ function savePrints() {
     return;
   const entries = [...cached.entries()].slice(-5000);
   try {
-    mkdirSync6(dirname6(printsFile()), { recursive: true });
-    writeFileSync4(printsFile(), JSON.stringify(Object.fromEntries(entries)));
+    mkdirSync7(dirname7(printsFile()), { recursive: true });
+    writeFileSync5(printsFile(), JSON.stringify(Object.fromEntries(entries)));
   } catch {}
 }
 function folderPrint(root) {
@@ -3385,14 +3468,14 @@ function whence(repo, text, limit = 8, scope = {}, context = {}) {
 }
 
 // protocol/catchup.ts
-import { appendFileSync as appendFileSync4, mkdirSync as mkdirSync9, readFileSync as readFileSync9, readdirSync as readdirSync5, statSync as statSync7 } from "fs";
+import { appendFileSync as appendFileSync4, mkdirSync as mkdirSync10, readFileSync as readFileSync9, readdirSync as readdirSync5, statSync as statSync7 } from "fs";
 import { join as join14 } from "path";
 
 // protocol/backfill.ts
 import { existsSync as existsSync8, readdirSync as readdirSync4, readFileSync as readFileSync8, statSync as statSync6 } from "fs";
 
 // protocol/agents.ts
-import { closeSync as closeSync3, mkdirSync as mkdirSync7, openSync as openSync3, readFileSync as readFileSync5, readSync as readSync3, statSync as statSync4, writeFileSync as writeFileSync5 } from "fs";
+import { closeSync as closeSync3, mkdirSync as mkdirSync8, openSync as openSync3, readFileSync as readFileSync5, readSync as readSync3, statSync as statSync4, writeFileSync as writeFileSync6 } from "fs";
 import { homedir as homedir6 } from "os";
 import { join as join10 } from "path";
 var AGENTS = ["claude-code", "codex", "cursor"];
@@ -3455,8 +3538,8 @@ function noteSession(agent, repo, session) {
       return;
     all[key] = { session, ts: new Date().toISOString() };
     const file = sessionsFile();
-    mkdirSync7(join10(file, ".."), { recursive: true });
-    writeFileSync5(file, JSON.stringify(all));
+    mkdirSync8(join10(file, ".."), { recursive: true });
+    writeFileSync6(file, JSON.stringify(all));
   } catch {}
 }
 function currentSession(agent, repo) {
@@ -3778,7 +3861,7 @@ function ingest(repo, events, opts = {}) {
 
 // protocol/keep.ts
 import { createHash as createHash4 } from "crypto";
-import { appendFileSync as appendFileSync3, closeSync as closeSync4, existsSync as existsSync7, mkdirSync as mkdirSync8, openSync as openSync4, readFileSync as readFileSync7, readdirSync as readdirSync3, readSync as readSync4, renameSync as renameSync2, rmSync as rmSync4, statSync as statSync5, truncateSync, writeFileSync as writeFileSync6 } from "fs";
+import { appendFileSync as appendFileSync3, closeSync as closeSync4, existsSync as existsSync7, mkdirSync as mkdirSync9, openSync as openSync4, readFileSync as readFileSync7, readdirSync as readdirSync3, readSync as readSync4, renameSync as renameSync2, rmSync as rmSync4, statSync as statSync5, truncateSync, writeFileSync as writeFileSync7 } from "fs";
 import { homedir as homedir7 } from "os";
 import { basename as basename3, join as join12 } from "path";
 import { constants as constants2, gunzipSync } from "zlib";
@@ -3803,14 +3886,14 @@ function keepSession(repo, agent, session, source, opts = {}) {
       if (!opts.force && Date.now() - copied < THROTTLE_MS)
         return dest;
     }
-    mkdirSync8(join12(dest, ".."), { recursive: true, mode: 448 });
+    mkdirSync9(join12(dest, ".."), { recursive: true, mode: 448 });
     if (dest.endsWith(".gz") && appendNew(source, dest))
       return dest;
     rmSync4(markOf(dest), { force: true });
     const raw = readFileSync7(source);
     const body = dest.endsWith(".gz") ? Bun.gzipSync(raw) : raw;
     const tmp = `${dest}.tmp`;
-    writeFileSync6(tmp, body, { mode: 384 });
+    writeFileSync7(tmp, body, { mode: 384 });
     renameSync2(tmp, dest);
     if (dest.endsWith(".gz"))
       mark(dest, raw.length, raw);
@@ -4022,7 +4105,9 @@ function codexSessions(root = join13(codexDir(), "sessions")) {
 }
 function codexMeta(path) {
   try {
-    const first = readFileSync8(path, "utf8").split(`
+    const head = readHead(path, 256 * 1024) ?? "";
+    const first = (head.includes(`
+`) ? head : readFileSync8(path, "utf8")).split(`
 `, 1)[0] ?? "";
     const row = JSON.parse(first);
     if (row.type !== "session_meta")
@@ -4377,7 +4462,7 @@ function noteWritten(session, paths) {
   if (!paths.length)
     return;
   try {
-    mkdirSync9(stateRoot(), { recursive: true });
+    mkdirSync10(stateRoot(), { recursive: true });
     appendFileSync4(writtenFile(session), `${paths.join(`
 `)}
 `);
@@ -4421,18 +4506,15 @@ function catchUpOffer(repo, session, records) {
     said();
     return null;
   }
-  const before = [
-    sessions ? `${sessions} earlier agent session${sessions === 1 ? "" : "s"}` : null,
-    files.length ? `files that hold numbers, such as ${files.map((p) => `\`${p}\``).join(", ")}` : null
-  ].filter(Boolean).join(" and ");
-  const ways = [
-    sessions ? `past sessions with \`bun ${shellWord(CLI)} catch-up --repo ${shellWord(repo)}\`, which imports them as private records` : null,
-    files.length ? "the numbers they rely on, with anvc_result naming each one's file and key" : null
-  ].filter(Boolean);
-  return {
-    said,
-    text: `anvc is on in this repository, and work happened here before it was: ${before}. ANVC has none of it yet. Ask the user whether to bring in ${ways.join(", and ")}. Do ${ways.length > 1 ? "neither" : "nothing"} without a yes.` + (files.length ? " Record the numbers several to a call, and from a subagent if you can start one, so this conversation stays short." : "")
-  };
+  const named = files.map((p) => `\`${p}\``).join(", ");
+  const how = "with anvc_result naming each one's file and key";
+  const batch = "Record the numbers several to a call, and from a subagent if you can start one, so this conversation stays short.";
+  const text = sessions ? `anvc is on in this repository, and ${plural(sessions, "earlier agent session")} here ${sessions === 1 ? "isn't" : "aren't"} in it yet. ` + `In your next reply, first ask the user one short question: whether to import ${sessions === 1 ? "it" : "them"} as private records, such as "Import the ${sessions === 1 ? "earlier session" : `${sessions} earlier sessions`} into ANVC?". ` + `Recommend yes, and on a yes run \`${anvcCommand()} catch-up --repo ${shellWord(repo)}\`. Don't run it without one.` + (files.length ? ` Files here also hold numbers, such as ${named}. After that, offer separately to record the ones the user relies on, ${how}. ${batch}` : "") : `anvc is on in this repository, and work happened here before it was: files that hold numbers, such as ${named}. ANVC has none of it yet. ` + `Ask the user whether to bring in the numbers they rely on, ${how}. Do nothing without a yes. ${batch}`;
+  return { said, text };
+}
+function earlierSessions(repo) {
+  const kept = new Set(keptSessions(repo).map((k) => k.session));
+  return sessionFiles(repo).filter((s) => !kept.has(s.session)).length;
 }
 function catchUp(repo) {
   const found = backfill(repo, { scrub });
@@ -4445,9 +4527,9 @@ function catchUp(repo) {
 }
 
 // protocol/sources.ts
-import { appendFileSync as appendFileSync5, mkdirSync as mkdirSync10 } from "fs";
+import { appendFileSync as appendFileSync5, mkdirSync as mkdirSync11 } from "fs";
 import { createHash as createHash5, randomBytes as randomBytes2 } from "crypto";
-import { dirname as dirname7, join as join15, resolve as resolve5 } from "path";
+import { dirname as dirname8, join as join15, resolve as resolve5 } from "path";
 var MAX_SOURCE = 64 * 1024;
 var MAX_ASKED = 2000;
 var MAX_READ = 4 * 1024 * 1024;
@@ -4537,7 +4619,7 @@ ${text ?? ""}`).digest("hex").slice(0, 16);
   });
   if (!rows.length)
     return 0;
-  mkdirSync10(dirname7(file), { recursive: true, mode: 448 });
+  mkdirSync11(dirname8(file), { recursive: true, mode: 448 });
   appendFileSync5(file, rows.map((r) => JSON.stringify(r)).join(`
 `) + `
 `, { mode: 384 });
@@ -4765,7 +4847,7 @@ function errorLine(output) {
 
 // protocol/recheck.ts
 import { createHash as createHash6 } from "crypto";
-import { mkdirSync as mkdirSync11, writeFileSync as writeFileSync7 } from "fs";
+import { mkdirSync as mkdirSync12, writeFileSync as writeFileSync8 } from "fs";
 import { join as join16 } from "path";
 var COMMANDS = [
   "bun test",
@@ -4832,8 +4914,8 @@ function verifyCached(repo, command) {
   cache[key] = { result, ts: new Date().toISOString() };
   const entries = Object.entries(cache).sort((a, b) => b[1].ts.localeCompare(a[1].ts)).slice(0, 200);
   try {
-    mkdirSync11(join16(cacheFile(), ".."), { recursive: true });
-    writeFileSync7(cacheFile(), JSON.stringify(Object.fromEntries(entries)));
+    mkdirSync12(join16(cacheFile(), ".."), { recursive: true });
+    writeFileSync8(cacheFile(), JSON.stringify(Object.fromEntries(entries)));
   } catch {}
   return result;
 }
@@ -4921,8 +5003,8 @@ function fit3(record, filled, output) {
 import { readFileSync as readFileSync10 } from "fs";
 
 // protocol/goals.ts
-import { existsSync as existsSync9, mkdirSync as mkdirSync12, rmSync as rmSync5, writeFileSync as writeFileSync8 } from "fs";
-import { dirname as dirname8 } from "path";
+import { existsSync as existsSync9, mkdirSync as mkdirSync13, rmSync as rmSync5, writeFileSync as writeFileSync9 } from "fs";
+import { dirname as dirname9 } from "path";
 var GOAL_LABELS = { todo: "To do", doing: "In progress", done: "Done", dropped: "Dropped" };
 var approvalOn = (repo) => {
   const path = marker(repo, "approve-goals");
@@ -4936,8 +5018,8 @@ function setApproval(repo, on) {
     rmSync5(path, { force: true });
     return;
   }
-  mkdirSync12(dirname8(path), { recursive: true });
-  writeFileSync8(path, `Goals an agent adds or changes wait for the person to accept them.
+  mkdirSync13(dirname9(path), { recursive: true });
+  writeFileSync9(path, `Goals an agent adds or changes wait for the person to accept them.
 `);
 }
 var proposes = (repo, actor) => actor.kind === "agent" && approvalOn(repo);
@@ -5617,7 +5699,7 @@ try {
   }
   const rows = call.paths.length > 1 ? call.paths.map((p) => ({ ...record, path: record.path === null ? null : resolve6(cwd, p) })) : [record];
   const file = captureFile(repo, day);
-  mkdirSync13(dirname9(file), { recursive: true, mode: 448 });
+  mkdirSync14(dirname10(file), { recursive: true, mode: 448 });
   appendFileSync6(file, rows.map((r) => JSON.stringify(r)).join(`
 `) + `
 `, { mode: 384 });

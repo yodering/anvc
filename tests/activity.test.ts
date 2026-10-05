@@ -10,7 +10,7 @@ import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { logActivity, readActivity, receipt, repoRoot, type Activity } from "../protocol/activity";
 import { appendRecord, ulid, type CheckpointRecord } from "../protocol/record";
-import { git, gitRepo, rpc, runHook, tmp } from "./helpers";
+import { cli, git, gitRepo, rpc, runHook, tmp } from "./helpers";
 
 const row = (over: Partial<Activity>): Activity => ({ ts: new Date().toISOString(), kind: "injected", repo: "/r", session: "s", ...over });
 
@@ -122,4 +122,15 @@ test("a turn that recorded many results counts them in the receipt instead of na
   expect(text).toContain("recorded 2 attempts (1 kept, 1 abandoned)");
   expect(text).not.toContain("Result 7");
   expect(receipt([results[0]!])).toContain("recorded a result: Result 0 = 0.0");
+});
+
+test("anvc activity says what a tool with no search term looked at", () => {
+  const repo = gitRepo({ commit: true });
+  const root = repoRoot(repo)!;
+  logActivity({ kind: "searched", repo: root, session: "s-quiet", via: "anvc_dead_ends", query: "", hits: 2, records: ["A", "B"], titles: [] });
+  logActivity({ kind: "searched", repo: root, session: "s-quiet", via: "anvc_search", query: "redis pool", hits: 1, records: ["A"], titles: [] });
+  const out = cli(repo, "activity").out;
+  expect(out).toContain("open dead ends → 2 found   (anvc_dead_ends)");
+  expect(out).toContain('"redis pool" → 1 hit   (anvc_search)');
+  expect(out).not.toContain('""');
 });

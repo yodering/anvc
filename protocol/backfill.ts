@@ -27,7 +27,7 @@ import { isAbsolute, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { DELEGATE_TOOLS, type CaptureEvent } from "./ingest";
 import { keptSessions, readKept } from "./keep";
-import { inRepo, isRepo, keepOutput } from "./rawlog";
+import { inRepo, isRepo, keepOutput, readHead } from "./rawlog";
 import { scrub as scrubSecrets } from "./scrub";
 
 /**
@@ -210,10 +210,15 @@ export function codexSessions(root = join(codexDir(), "sessions")): string[] {
   return out.sort();
 }
 
-/** A Codex session's id and starting directory, from its first line. */
+/**
+ * A Codex session's id and starting directory, from its first line. Only the
+ * start of the file is read: the first line was about 22 KB in 52 sessions
+ * here, which held 1.6 GB, and reading them whole took 1.2 s.
+ */
 export function codexMeta(path: string): { id: string | null; cwd: string | null } {
   try {
-    const first = readFileSync(path, "utf8").split("\n", 1)[0] ?? "";
+    const head = readHead(path, 256 * 1024) ?? "";
+    const first = (head.includes("\n") ? head : readFileSync(path, "utf8")).split("\n", 1)[0] ?? "";
     const row = JSON.parse(first) as { type?: string; payload?: { cwd?: unknown; id?: unknown } };
     if (row.type !== "session_meta") return { id: null, cwd: null };
     return {

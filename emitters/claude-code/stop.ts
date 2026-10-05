@@ -39,7 +39,8 @@ import { tellOnce } from "../../protocol/folders";
 import { captureFile, captureRows, inRepo, metricsRoot, stateRoot } from "../../protocol/rawlog";
 import { readPolicy } from "../../protocol/policy";
 import { scrub } from "../../protocol/scrub";
-import { checkDaily, hooksBehind, managedBy, readUpdate, updateLine } from "../../protocol/version";
+import { shellWord } from "../../protocol/args";
+import { anvcCommand, checkDaily, hooksBehind, managedBy, readUpdate, updateLine } from "../../protocol/version";
 import { continueOutput, continuing, hookInput, hookRepo, noticeOutput, patchPaths } from "../../protocol/agents";
 import { openItems } from "../../protocol/status";
 import { hitsById, printable, withIndex } from "../../protocol/query";
@@ -209,7 +210,7 @@ try {
     const about = told === today || process.env.ANVC_NO_UPDATE_NOTICE ? [] : [
       updateLine(readUpdate()),
       // The plugin's hooks are the plugin's own, so they're as new as it is.
-      managedBy() !== "plugin" && hooksBehind(repo, agent) ? "This repository's ANVC hooks are older than ANVC. Run: bun run anvc update" : null,
+      managedBy() !== "plugin" && hooksBehind(repo, agent) ? `This repository's ANVC hooks are older than ANVC. Run: ${anvcCommand()} update` : null,
       leftBehindLine(recordsLeftBehind(repo)),
     ].filter(Boolean);
     if (about.length) { try { mkdirSync(stateDir, { recursive: true }); writeFileSync(dayFile, today); } catch { /* said again tomorrow */ } }
@@ -217,7 +218,7 @@ try {
     // person hears where it is on and how to turn it off. Cursor's stop hook
     // has nowhere to show a line, so the work log's switch is its only notice.
     const here = agent !== "cursor" && !process.env.ANVC_NO_UPDATE_NOTICE && tellOnce(root)
-      ? `ANVC is on for this project. To turn it off: ${managedBy() === "plugin" ? "/anvc:off" : `bun run anvc off --repo ${root}`}, or the switch in the work log.`
+      ? `ANVC is on for this project. To turn it off: ${managedBy() === "plugin" ? "/anvc:off" : `${anvcCommand()} off --repo ${shellWord(root)}`}, or the switch in the work log.`
       : null;
     const text = [done, ...about, here].filter(Boolean).join("\n") || null;
     const notice = text ? noticeOutput(agent, text) : null;

@@ -14,7 +14,7 @@
  * A push of code alone passes through in silence.
  */
 import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { join, resolve } from "node:path";
 import { quoted } from "../scripts/hookfiles";
 import { isLocalOnly, LOCAL_ONLY_REFUSAL } from "./localonly";
 import { git, readRefs } from "./git";
@@ -22,7 +22,7 @@ import { below, samePath } from "./rawlog";
 import { findSecrets } from "./scrub";
 import { TIER_PREFIX, type CheckpointRecord } from "./record";
 import { checkPrivateRemote, PRIVATE_REFS, privateRemote } from "./sync";
-import { CLI } from "./version";
+import { anvcCommand, notePointer, pointerFile } from "./version";
 
 const ZERO = /^0+$/;
 
@@ -37,41 +37,63 @@ export function prePushOn(repo: string): boolean {
 }
 
 /**
- * Installs the pre-push check. A hook already there moves aside and runs
- * first, and its answer stands. Throws where hooks live inside the project
- * (core.hooksPath, as husky sets it): a hook written there would be committed,
- * naming this computer's path.
+ * The hook's script. A plugin update moves ANVC's command line, so the hook
+ * runs the one named in ~/.anvc/cli, which each session start keeps current,
+ * and a check that's gone mustn't stop every push. A POSIX sh script on every
+ * system: Git for Windows runs hooks with the sh it ships.
  */
-export function installPrePush(repo: string): string {
-  const dir = samePath(resolve(hookFile(repo), ".."));
-  const hook = resolve(dir, "pre-push");
-  const run = `bun ${quoted(CLI)} pre-push --repo "$(git rev-parse --show-toplevel)" "$@"`;
-  if (below(samePath(git(repo, ["rev-parse", "--path-format=absolute", "--git-common-dir"])), dir) === null) {
-    throw new Error(`hooks here live in ${dir}, which is part of the project; add this line to your pre-push hook instead:\n    ${run}`);
-  }
-  const before = `${hook}.before-anvc`;
-  // A plugin update moves ANVC, and a check that's gone mustn't stop every push.
-  // A POSIX sh script on every system: Git for Windows runs hooks with the sh
-  // it ships, and there the chmod below does nothing and isn't needed.
-  const script = `#!/bin/sh
+function prePushScript(before: string): string {
+  const pointer = pointerFile();
+  const missing = `anvc: push check skipped. The ANVC command line named in ${pointer} isn't there. Start a new agent session, and it's named again.`;
+  return `#!/bin/sh
 # anvc: runs the pre-push hook that was here first, then checks the records
 # this push shares. To undo: anvc push-check off
 input=$(cat)
 if [ -x ${quoted(before)} ]; then
   printf '%s\\n' "$input" | ${quoted(before)} "$@" || exit $?
 fi
-if [ ! -f ${quoted(CLI)} ]; then
-  echo "anvc: push check skipped; ANVC moved. Run anvc push-check on to fix it." >&2
+cli=$(cat ${quoted(pointer)} 2>/dev/null)
+if [ ! -f "$cli" ]; then
+  printf '%s\\n' ${quoted(missing)} >&2
   exit 0
 fi
-printf '%s\\n' "$input" | ${run}
+printf '%s\\n' "$input" | bun "$cli" pre-push --repo "$(git rev-parse --show-toplevel)" "$@"
 `;
+}
+
+/**
+ * Installs the pre-push check. A hook already there moves aside and runs
+ * first, and its answer stands. Throws where hooks live inside the project
+ * (core.hooksPath, as husky sets it): a hook written there would be committed,
+ * naming this computer's paths.
+ */
+export function installPrePush(repo: string): string {
+  const dir = samePath(resolve(hookFile(repo), ".."));
+  const hook = resolve(dir, "pre-push");
+  if (below(samePath(git(repo, ["rev-parse", "--path-format=absolute", "--git-common-dir"])), dir) === null) {
+    throw new Error(`hooks here live in ${dir}, which is part of the project; add this line to your pre-push hook instead:\n    ${anvcCommand()} pre-push --repo "$(git rev-parse --show-toplevel)" "$@"`);
+  }
+  notePointer();
+  const before = `${hook}.before-anvc`;
   mkdirSync(dir, { recursive: true });
   const current = existsSync(hook) ? readFileSync(hook, "utf8") : "";
   if (current && !current.includes(MARK)) renameSync(hook, before);
-  writeFileSync(hook, script);
+  writeFileSync(hook, prePushScript(before));
   chmodSync(hook, 0o755);
   return `pre-push hook installed${current && !current.includes("anvc:") ? "; your earlier one runs first, from pre-push.before-anvc" : ""}`;
+}
+
+/**
+ * Writes this version's check over one an earlier ANVC installed. Until 0.4.10
+ * the check named the command line by its path, which a plugin update
+ * removes. Session starts call this, and with no hook it reads one missing
+ * file. Hooks outside .git/hooks are left as they are.
+ */
+export function refreshPrePush(root: string): void {
+  try {
+    const text = readFileSync(join(root, ".git", "hooks", "pre-push"), "utf8");
+    if (text.includes(MARK) && !text.includes(`cat ${quoted(pointerFile())}`)) installPrePush(root);
+  } catch { /* no check here, or it stays as it was */ }
 }
 
 /** Takes the check out, and puts back the hook it wrapped. Null when it isn't here. */

@@ -38,7 +38,7 @@ const QUESTIONS: Array<[string, ComponentChildren]> = [
     In a repository with about 100 records, the hooks took 36 ms before each tool call and 13 ms after it. Whatever ANVC tells the agent at once stays under 9,000 characters.
   </>],
   ["I turned ANVC on in a project I'd already worked on. Can it catch up?", <>
-    Yes. The first session after, your agent offers to bring in the earlier sessions and to record the numbers already in your files. From a terminal, <code>anvc catch-up</code> imports the sessions and lists those files.
+    Yes. The first session after, your agent asks whether to import the earlier sessions, then offers to record the numbers already in your files. The empty work log has a button for the import, and in a terminal <code>anvc catch-up</code> does it and lists those files.
   </>],
   ["Can an old record mislead my agent?", <>
     It can, so each record is shown with when it was written, and a dead end's check can run first to see if it still fails. A record that's no longer true can be retired, and then it isn't shown.

@@ -17,11 +17,11 @@ import { isLocalOnly } from "../protocol/localonly";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { basename, resolve } from "node:path";
 import { below, samePath } from "../protocol/rawlog";
-import { flag, has } from "../protocol/args";
+import { flag, has, shellWord } from "../protocol/args";
 import { configureRemote, git, gitOrNull } from "../protocol/git";
 import { addInstructions, INSTRUCTION_LINES, instructionsFile, instructionsOn } from "../protocol/instructions";
 import { installPrePush, prePushOn } from "../protocol/prepush";
-import { GLOBAL, installs, noteInstall } from "../protocol/version";
+import { anvcCommand, GLOBAL, installLauncher, installs, noteInstall } from "../protocol/version";
 import { AGENTS } from "../protocol/agents";
 import { claudeHooks, codexHooks, cursorHooks, installedAgents, mergeCursorHooks, mergeHooks, planner, quoted, readJsonOrExit, removeOurs } from "./hookfiles";
 
@@ -355,18 +355,23 @@ function cursorMcp(): string {
   If Cursor shows the server as off, turn it on in its MCP settings.`;
 }
 
+const launcher = installLauncher(dry);
+if (launcher?.changed) dry ? plan(launcher.file, "add a launcher that runs ANVC from any folder") : say(`✓ Added ${launcher.file}, which runs ANVC from any folder`);
+const cli = anvcCommand();
+const at = shellWord(repo);
+
 say(`
 ${agent === "claude-code" && has(argv, "plugin") ? "The plugin brings the MCP server; there is nothing to register." : register[agent] ?? json("your agent's MCP configuration")}
 
 Then:
 
-  bun run ui --repo ${repo}
+  ${cli} open --repo ${at}
                                   the work log, in your browser
-  bun run anvc stats --repo ${repo}
+  ${cli} stats --repo ${at}
                                   how much has been recorded here
-  bun run anvc failed --repo ${repo}
+  ${cli} failed --repo ${at}
                                   attempts that errored
-  bun run anvc tiers --repo ${repo}
+  ${cli} tiers --repo ${at}
                                   what is private, and what git push will share
 
 ${instructions}

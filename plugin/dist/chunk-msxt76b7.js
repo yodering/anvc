@@ -6788,11 +6788,11 @@ var QUESTIONS = [
   }, undefined, false, undefined, this)],
   ["I turned ANVC on in a project I'd already worked on. Can it catch up?", /* @__PURE__ */ u3(S, {
     children: [
-      "Yes. The first session after, your agent offers to bring in the earlier sessions and to record the numbers already in your files. From a terminal, ",
+      "Yes. The first session after, your agent asks whether to import the earlier sessions, then offers to record the numbers already in your files. The empty work log has a button for the import, and in a terminal ",
       /* @__PURE__ */ u3("code", {
         children: "anvc catch-up"
       }, undefined, false, undefined, this),
-      " imports the sessions and lists those files."
+      " does it and lists those files."
     ]
   }, undefined, true, undefined, this)],
   ["Can an old record mislead my agent?", /* @__PURE__ */ u3(S, {
@@ -7139,22 +7139,90 @@ function Version() {
   }, undefined, true, undefined, this);
 }
 function Welcome({
+  on,
+  again,
+  onTurnOn,
   onSetup,
-  onExample
+  onExample,
+  onImported
 }) {
+  const [start, setStart] = d2(null);
+  const [importing, setImporting] = d2(false);
+  const [said, setSaid] = d2("");
+  h2(() => {
+    getJson("/api/start").then(setStart).catch(() => {});
+  }, [again]);
+  const importEarlier = async () => {
+    setImporting(true);
+    try {
+      const done = await (await send("/api/start", {})).json();
+      if (done.error)
+        setSaid(`Couldn't import: ${done.error}`);
+      else if (done.written) {
+        setSaid(`Imported ${plural(done.written, "record")} from ${plural(done.sessions ?? 0, "session")}.`);
+        onImported();
+      } else
+        setSaid("Those sessions had nothing to import.");
+      getJson("/api/start").then(setStart).catch(() => {});
+    } catch {
+      setSaid("Couldn't reach the ANVC server.");
+    } finally {
+      setImporting(false);
+    }
+  };
+  const example = /* @__PURE__ */ u3("button", {
+    class: "button",
+    onClick: onExample,
+    children: [
+      "View example",
+      /* @__PURE__ */ u3(Icon, {
+        name: "arrow-right"
+      }, undefined, false, undefined, this)
+    ]
+  }, undefined, true, undefined, this);
+  if (on === false)
+    return /* @__PURE__ */ u3("div", {
+      class: "welcome",
+      children: [
+        /* @__PURE__ */ u3("h2", {
+          children: "ANVC is off for this project"
+        }, undefined, false, undefined, this),
+        /* @__PURE__ */ u3("p", {
+          children: "Nothing is saved here or shown to agents."
+        }, undefined, false, undefined, this),
+        /* @__PURE__ */ u3("div", {
+          class: "welcome-actions",
+          children: [
+            /* @__PURE__ */ u3("button", {
+              class: "button primary",
+              onClick: onTurnOn,
+              children: "Turn on"
+            }, undefined, false, undefined, this),
+            example
+          ]
+        }, undefined, true, undefined, this)
+      ]
+    }, undefined, true, undefined, this);
+  const connected = start && start.agents.length > 0;
+  const earlier = start?.earlier ? /* @__PURE__ */ u3("button", {
+    class: `button${connected ? " primary" : ""}`,
+    onClick: importEarlier,
+    disabled: importing,
+    children: importing ? "Importing…" : `Import ${plural(start.earlier, "earlier session")}`
+  }, undefined, false, undefined, this) : null;
   return /* @__PURE__ */ u3("div", {
     class: "welcome",
     children: [
       /* @__PURE__ */ u3("h2", {
         children: "Nothing recorded yet"
       }, undefined, false, undefined, this),
-      /* @__PURE__ */ u3("p", {
-        children: "Connect an agent to start."
+      start && /* @__PURE__ */ u3("p", {
+        children: connected ? "ANVC is on. Records appear here when your agent saves its work or a session ends." : "Connect an agent to start."
       }, undefined, false, undefined, this),
-      /* @__PURE__ */ u3("div", {
+      start && /* @__PURE__ */ u3("div", {
         class: "welcome-actions",
         children: [
-          /* @__PURE__ */ u3("button", {
+          !connected && /* @__PURE__ */ u3("button", {
             class: "button primary",
             onClick: onSetup,
             children: [
@@ -7164,18 +7232,15 @@ function Welcome({
               "Connect an agent"
             ]
           }, undefined, true, undefined, this),
-          /* @__PURE__ */ u3("button", {
-            class: "button",
-            onClick: onExample,
-            children: [
-              "View example",
-              /* @__PURE__ */ u3(Icon, {
-                name: "arrow-right"
-              }, undefined, false, undefined, this)
-            ]
-          }, undefined, true, undefined, this)
+          earlier,
+          example
         ]
-      }, undefined, true, undefined, this)
+      }, undefined, true, undefined, this),
+      said && /* @__PURE__ */ u3("p", {
+        class: "welcome-said",
+        role: "status",
+        children: said
+      }, undefined, false, undefined, this)
     ]
   }, undefined, true, undefined, this);
 }
@@ -8118,7 +8183,7 @@ function App() {
                   }, undefined, true, undefined, this)
                 ]
               }, undefined, true, undefined, this),
-              page === "work" && !example && /* @__PURE__ */ u3(OffBanner, {
+              page === "work" && !example && !(loaded && !data.turns.length) && /* @__PURE__ */ u3(OffBanner, {
                 folders: folderState
               }, undefined, false, undefined, this),
               page === "work" && !example && !session && loaded && /* @__PURE__ */ u3(HelpedBlock, {}, undefined, false, undefined, this),
@@ -8293,8 +8358,12 @@ function App() {
                 ]
               }, undefined, true, undefined, this),
               page === "work" && !example && loaded && !data.turns.length && /* @__PURE__ */ u3(Welcome, {
+                on: folderState.here?.on ?? null,
+                again: setup,
+                onTurnOn: () => folderState.here && void folderState.set(folderState.here.repo, true),
                 onSetup: () => setSetup(true),
-                onExample: () => switchExample(true)
+                onExample: () => switchExample(true),
+                onImported: load
               }, undefined, false, undefined, this)
             ]
           }, undefined, true, undefined, this)

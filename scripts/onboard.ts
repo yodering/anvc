@@ -42,6 +42,7 @@ import { setDataMode, type DataMode } from "../protocol/results";
 import { ABSORB_COST, ABSORB_MODES, setAbsorbMode, type AbsorbMode } from "../protocol/absorb";
 import { samePath } from "../protocol/rawlog";
 import { tilde } from "../protocol/tools";
+import { anvcCommand } from "../protocol/version";
 
 const here = resolve(import.meta.dir, "..");
 const bold = (s: string) => `\x1b[1m${s}\x1b[22m`;
@@ -373,9 +374,10 @@ if (byAgent) {
   const others = agents.filter((a) => a !== "claude-code").map((a) => AGENT_NAMES[a]);
   const lines = [
     ...(agents.includes("claude-code") ? [["In Claude Code", "/anvc:setup"]] : []),
-    // Other agents get no slash command, and their project has no `bun run anvc`.
-    // The same two offers /anvc:setup ends with (scripts/build-plugin.ts).
-    ...(others.length ? [[`In ${others.join(" or ")}`, `Set up ANVC for me: run \`bun ${shellWord(`${here}/protocol/cli.ts`)} options\` and follow it. `
+    // Other agents get no slash command. The same import question and two
+    // offers /anvc:setup ends with (scripts/build-plugin.ts).
+    ...(others.length ? [[`In ${others.join(" or ")}`, `Set up ANVC for me: run \`${anvcCommand()} options\` and follow it. `
+      + `Next, ask me in one short question whether to import this project's earlier sessions with \`${anvcCommand()} catch-up\`. `
       + "Then ask me before each of these: draft this project's goals and sub-goals from its README, docs and code, only ones those files support, "
       + "show me the list, and add the ones I agree to with anvc_goal; and add a rule set with anvc_rule for each kind of text the project already has rules for "
       + "(a heading in AGENTS.md or CLAUDE.md, CONTRIBUTING, a style guide), with source pointing at that file and heading."]] : []),
@@ -435,7 +437,7 @@ const open = everywhere && agents.includes("claude-code") ? "/anvc:open in Claud
 outro([
   "Done. Start a new session in your agent so it loads ANVC.",
   "",
-  `${dim("Open the work log")}   ${open}, or bun run anvc open${where}`,
-  `${dim("Turn it off")}         bun run anvc off${everywhere ? " --repo <project>" : where}, in one project`,
+  `${dim("Open the work log")}   ${open}, or ${anvcCommand()} open${where}`,
+  `${dim("Turn it off")}         ${anvcCommand()} off${everywhere ? " --repo <project>" : where}, in one project`,
   `${dim("Change a setting")}    bun run setup again, or Settings in the work log`,
 ].join("\n"));

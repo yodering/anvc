@@ -28,7 +28,9 @@ import { join, resolve } from "node:path";
 import { checkDocument } from "../protocol/check";
 import { startServer } from "../protocol/open";
 import { existsSync, statSync } from "node:fs";
-import { addFolder, foundView, setupAgents } from "../protocol/found";
+import { addFolder, connectedAgents, foundView, setupAgents } from "../protocol/found";
+import { AGENT_NAMES } from "../protocol/agents";
+import { catchUp, earlierSessions } from "../protocol/catchup";
 import { uninstallEverywhere } from "../protocol/uninstall";
 import { configureRemote, gitOrNull, unconfigureRemote } from "../protocol/git";
 import { addInstructions, removeInstructions } from "../protocol/instructions";
@@ -38,10 +40,10 @@ import { forRepo, retirements } from "../protocol/query";
 import { addRule, changeRule, listRules, parseApplies, parseFrom, removeRule, ruleFiles, ruleText } from "../protocol/rules";
 import { absorbView, clearProjectAbsorbMode, setAbsorbMode, type AbsorbMode } from "../protocol/absorb";
 import { personDecide } from "../protocol/retire";
-import { checkDaily, CLI, desktopFile, HOME, hooksBehind, installs, managedBy, readUpdate, stateHome, update, version } from "../protocol/version";
+import { anvcCommand, checkDaily, desktopFile, HOME, hooksBehind, installs, managedBy, readUpdate, stateHome, update, version } from "../protocol/version";
 import { repoRoot } from "../protocol/activity";
 import { exportPolicy, FIELDS, importPolicy, PRESETS, readPolicy, writePolicy, type Policy } from "../protocol/policy";
-import { folders, setFolder } from "../protocol/folders";
+import { folderOn, folders, setFolder } from "../protocol/folders";
 import { flag, shellWord } from "../protocol/args";
 import { tierFacts } from "../protocol/tiers";
 import { helpedView, mapView, repoView, statsView } from "./api";
@@ -139,7 +141,7 @@ const redeem = (code: string) => {
 
 const SIGN_IN = `<!doctype html><meta charset="utf-8"><meta name="color-scheme" content="light dark"><title>anvc</title>
 <body style="font: 16px/1.5 system-ui, sans-serif; max-width: 34em; margin: 4em auto; padding: 0 1em">
-<p>To sign in, run <code>/anvc:open</code> in Claude Code or <code>bun run anvc open</code> from a clone.</p>`;
+<p>To sign in, run <code>/anvc:open</code> in Claude Code or <code>${anvcCommand()} open</code> in a terminal.</p>`;
 
 const listen = (port: number) => Bun.serve({
   routes: { [PAGE]: repoPage },
@@ -321,6 +323,19 @@ async function answer(request: Request, ownPort: number | undefined): Promise<Re
       // Several agents each list the same change to git config or AGENTS.md.
       return post ? { output: tilde(out) } : { changes: [...new Set(out.split("\n").filter((l) => l.startsWith("- ")).map((l) => tilde(l.slice(2))))], kept: [] };
     });
+  }
+
+  // What the empty work log says: which agents have ANVC's hooks here, and
+  // how many sessions from before there are to import. A POST imports them,
+  // as `anvc catch-up` does.
+  if (url.pathname === "/api/start") {
+    return route("refused: sessions can only be imported from the anvc page",
+      () => ({ agents: connectedAgents(root).map((a) => AGENT_NAMES[a]!), earlier: earlierSessions(root) }),
+      () => {
+        if (!folderOn(root)) throw new Error("ANVC is off for this project. Turn it on to import sessions.");
+        const { failed, ...done } = catchUp(root);
+        return { ...done, failed: failed.length };
+      });
   }
 
   // How much ANVC does on its own, for this project and for every project.
@@ -540,10 +555,9 @@ async function answer(request: Request, ownPort: number | undefined): Promise<Re
       return {
         version: version(), managed: managedBy(), checked: u?.checked ?? null, behind: u?.behind ?? 0, changes: u?.changes ?? [],
         error: u?.error ?? null, hooksBehind: mine.some((i) => hooksBehind(i.repo, i.agent)),
-        // How the page's commands start and end: the CLI by its path, and
-        // this project, since a terminal can be anywhere. The desktop app
-        // has no CLI of its own; its commands run in the clone it came from.
-        cli: managedBy() === "desktop" ? "bun run anvc" : `bun ${shellWord(CLI)}`, repo: `--repo ${shellWord(root)}`,
+        // How the page's commands start and end: anvc, and this project,
+        // since a terminal can be anywhere.
+        cli: anvcCommand(), repo: `--repo ${shellWord(root)}`,
       };
     });
   }

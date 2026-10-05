@@ -3,11 +3,12 @@
  * record holds a credential. Checked against a real push to a bare remote.
  */
 import { expect, test } from "bun:test";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { chmod, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { appendRecord } from "../protocol/record";
-import { git, gitRepo, rec, tmp } from "./helpers";
+import { CLI, pointerFile } from "../protocol/version";
+import { git, gitRepo, rec, runHook, tmp } from "./helpers";
 
 const SETUP = resolve(import.meta.dir, "../scripts/setup.ts");
 // A fixture, shaped like a key and valid for nothing.
@@ -115,3 +116,35 @@ test("something under refs/anvc/ that isn't a record stops the push", async () =
   expect(out).toContain("refs/anvc/s/000001 isn't a record");
   expect(onRemote()).toBe("");
 });
+
+test("the check runs the ANVC a session start named last, so an update doesn't turn it off", () => {
+  const { repo, push } = setup();
+  install(repo);
+  expect(readFileSync(join(repo, ".git", "hooks", "pre-push"), "utf8")).not.toContain(CLI);
+  // The next version's session start names its own command line.
+  const next = join(tmp("anvc-next-"), "cli.js");
+  writeFileSync(next, `console.log("the next version", process.argv[2]);\n`);
+  writeFileSync(pointerFile(), next);
+  expect(push().out).toContain("the next version pre-push");
+
+  // With none there, the push goes through and says why nothing checked it.
+  writeFileSync(pointerFile(), join(repo, "gone.js"));
+  const gone = push();
+  expect(gone.code).toBe(0);
+  expect(gone.out).toContain("push check skipped");
+  writeFileSync(pointerFile(), CLI);
+});
+
+test("a session start writes again a check that named the version it ran", async () => {
+  const { repo, push } = setup();
+  const hook = join(repo, ".git", "hooks", "pre-push");
+  const old = join(tmp("anvc-old-"), "0.4.9", "dist", "cli.js");
+  await writeFile(hook, `#!/bin/sh\n# anvc: runs the pre-push hook that was here first, then checks the records\ninput=$(cat)\nif [ ! -f "${old}" ]; then\n  echo "anvc: push check skipped; ANVC moved." >&2\n  exit 0\nfi\n`);
+  await chmod(hook, 0o755);
+  expect(push("origin", "main").out).toContain("ANVC moved");
+  runHook("inject", "SessionStart", { hook_event_name: "SessionStart", session_id: "s1", cwd: repo, source: "startup" });
+  expect(readFileSync(hook, "utf8")).not.toContain(old);
+  expect(existsSync(`${hook}.before-anvc`)).toBe(false);
+  appendRecord(repo, rec({ intent: { goal: "Call the pricing API" } }));
+  expect(push("origin", "refs/anvc/*:refs/anvc/*").out).toContain("ANVC  sharing 1 record");
+}, 30_000);

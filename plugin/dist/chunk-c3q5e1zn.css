@@ -1645,6 +1645,10 @@ kbd {
   gap: 9px;
 }
 
+.welcome > p.welcome-said {
+  margin: 18px auto 0;
+}
+
 .example-banner, .error-banner {
   display: flex;
   background: var(--surface);

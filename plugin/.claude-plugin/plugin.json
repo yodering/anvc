@@ -1,6 +1,6 @@
 {
   "name": "anvc",
-  "version": "0.4.9",
+  "version": "0.4.10",
   "description": "Keeps what your coding agents tried, kept and abandoned, and shows them past dead ends before they repeat one.",
   "author": {
     "name": "ANVC contributors",

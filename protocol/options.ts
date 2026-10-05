@@ -23,7 +23,7 @@ import { prePushOn } from "./prepush";
 import { samePath } from "./rawlog";
 import { DATA_MODES, DEFAULT_DATA_MODE, dataMode, everywhereDataMode } from "./results";
 import { ABSORB_MODES, absorbMode, ABSORB_COST, DEFAULT_ABSORB_MODE } from "./absorb";
-import { CLI, GLOBAL, installs, managedBy, SETUP } from "./version";
+import { anvcCommand, GLOBAL, installs, managedBy, SETUP } from "./version";
 
 type Value = string | string[] | null;
 
@@ -85,10 +85,9 @@ const ON_OFF = [["on", "On"], ["off", "Off"]] as const;
  * decides whether each command has to name it.
  */
 export function options(root: string | null, cwd: string): Options {
-  // The person's project has no `bun run anvc`, so every command names this
-  // copy of ANVC by its path.
   const repoFlag = root && samePath(root) !== samePath(cwd) ? ` --repo ${shellWord(root)}` : "";
-  const anvc = (args: string) => `bun ${shellWord(CLI)} ${args}${repoFlag}`;
+  const cli = anvcCommand();
+  const anvc = (args: string) => `${cli} ${args}${repoFlag}`;
   const scoped = (args: string) => ({ set: root ? anvc(args) : null, setEverywhere: anvc(`${args} --everywhere`) });
   const setup = existsSync(SETUP) ? (args: string) => `bun ${shellWord(SETUP)} ${args}` : null;
   // A bare repository has records but no working folder to set up.
@@ -231,6 +230,78 @@ export function options(root: string | null, cwd: string): Options {
     about: `${ABOUT} These are its settings, each with the command that changes it. A setting with "asks": true can send something off this computer or change a file the project commits, so ask the person before changing it.`,
     repo: root,
     settings,
+  };
+}
+
+/**
+ * A setting as `anvc options --json` gives it to an agent. The full list
+ * repeated the command line's path in a command for every choice, here and
+ * for every project: 24,070 characters in one project, about 6,000 tokens
+ * of the agent's context. This keeps the values and one command per setting.
+ */
+export interface CompactSetting {
+  key: string;
+  name: string;
+  /** Only on a setting that asks first, which the agent explains before the person decides. */
+  what?: string;
+  here: Value;
+  everywhere?: Value;
+  recommended: string | string[];
+  chosen: boolean;
+  asks?: true;
+  overriddenBy?: string;
+  multiple?: true;
+  /** Each choice's value and label, or the values alone where the labels just repeat them. */
+  choices: Record<string, string> | string[];
+  /** The command, with <value> for a choice's value; or each choice's command, where they differ in more than that. */
+  set: string | Record<string, string>;
+  /** Each part's value in effect. `anvc options` describes them. */
+  parts?: Record<string, Value>;
+  /** The command that changes a part, with <part> and <value>. */
+  setPart?: string;
+}
+
+export interface CompactOptions { about: string; cli: string; repo: string | null; earlier: number; settings: CompactSetting[] }
+
+/**
+ * The list an agent reads to set ANVC up. `cli` is the command its other
+ * commands start with, and `earlier` the sessions from before ANVC was on
+ * that catch-up imports.
+ */
+export function compactOptions(o: Options, cli: string, earlier: number): CompactOptions {
+  return {
+    about: `${ABOUT} To change a setting, run set with a choice's value for <value>, and --everywhere for every project where it says so. Ask the person before changing one with "asks": true.`,
+    cli,
+    repo: o.repo,
+    earlier,
+    settings: o.settings.map(compactSetting),
+  };
+}
+
+/** One command for all of these, with each word that differs named in turn by `names`; null if they differ in more words. */
+function pattern(choices: Choice[], names: string[]): string | null {
+  const shared = template(choices.map((c) => c.set ?? c.setEverywhere ?? null));
+  const differ = shared?.match(/<[^>]*>/g) ?? [];
+  if (!shared || differ.length > names.length) return null;
+  const at = names.slice(names.length - differ.length);
+  let i = 0;
+  const everywhere = choices.every((c) => c.set && c.setEverywhere) ? " [--everywhere]" : "";
+  return `${shared.replace(/<[^>]*>/g, () => at[i++]!)}${everywhere}`;
+}
+
+function compactSetting(s: Setting): CompactSetting {
+  const named = s.choices.some((c) => c.label.toLowerCase() !== c.value);
+  const setPart = s.parts && pattern(s.parts.flatMap((p) => p.choices), ["<part>", "<value>"]);
+  return {
+    key: s.key, name: s.name, ...(s.asks ? { what: s.what } : {}),
+    here: s.here, ...(s.everywhere !== undefined ? { everywhere: s.everywhere } : {}),
+    recommended: s.recommended, chosen: s.chosen,
+    ...(s.asks ? { asks: true as const } : {}), ...(s.overriddenBy ? { overriddenBy: s.overriddenBy } : {}), ...(s.multiple ? { multiple: true as const } : {}),
+    choices: named ? Object.fromEntries(s.choices.map((c) => [c.value, c.label])) : s.choices.map((c) => c.value),
+    set: pattern(s.choices, ["<value>"])
+      ?? Object.fromEntries(s.choices.flatMap((c) => (c.set ?? c.setEverywhere ? [[c.value, (c.set ?? c.setEverywhere)!]] : []))),
+    ...(s.parts ? { parts: Object.fromEntries(s.parts.map((p) => [p.key, p.here ?? p.everywhere ?? null])) } : {}),
+    ...(setPart ? { setPart } : {}),
   };
 }
 

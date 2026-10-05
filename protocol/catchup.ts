@@ -17,12 +17,13 @@ import { shellWord } from "./args";
 import { backfill, sessionFiles } from "./backfill";
 import { gitOrNull } from "./git";
 import { ingest } from "./ingest";
-import { keepSession } from "./keep";
+import { keepSession, keptSessions } from "./keep";
+import { plural } from "./activity";
 import { marker } from "./localonly";
 import { readHead, readJson, stateRoot, writeJson } from "./rawlog";
 import { MANIFEST, skipDir } from "./results";
 import { scrub } from "./scrub";
-import { CLI } from "./version";
+import { anvcCommand } from "./version";
 
 /** Files that can hold results: data, notes and logs. Code and configuration can't. */
 const DATA = /\.(json|jsonl|csv|tsv|md|txt|log)$/i;
@@ -119,19 +120,25 @@ export function catchUpOffer(repo: string, session: string, records: number): { 
   const sessions = sessionFiles(repo).filter((s) => s.session !== session).length;
   const files = dataFiles(repo, 4);
   if (!sessions && !files.length) { said(); return null; }
-  const before = [
-    sessions ? `${sessions} earlier agent session${sessions === 1 ? "" : "s"}` : null,
-    files.length ? `files that hold numbers, such as ${files.map((p) => `\`${p}\``).join(", ")}` : null,
-  ].filter(Boolean).join(" and ");
-  const ways = [
-    sessions ? `past sessions with \`bun ${shellWord(CLI)} catch-up --repo ${shellWord(repo)}\`, which imports them as private records` : null,
-    files.length ? "the numbers they rely on, with anvc_result naming each one's file and key" : null,
-  ].filter(Boolean);
-  return {
-    said,
-    text: `anvc is on in this repository, and work happened here before it was: ${before}. ANVC has none of it yet. Ask the user whether to bring in ${ways.join(", and ")}. Do ${ways.length > 1 ? "neither" : "nothing"} without a yes.`
-      + (files.length ? " Record the numbers several to a call, and from a subagent if you can start one, so this conversation stays short." : ""),
-  };
+  const named = files.map((p) => `\`${p}\``).join(", ");
+  const how = "with anvc_result naming each one's file and key";
+  const batch = "Record the numbers several to a call, and from a subagent if you can start one, so this conversation stays short.";
+  // The sessions come first, in a question of their own: offered as one of
+  // three next steps, the import was passed over and the log stayed empty.
+  const text = sessions
+    ? `anvc is on in this repository, and ${plural(sessions, "earlier agent session")} here ${sessions === 1 ? "isn't" : "aren't"} in it yet. `
+      + `In your next reply, first ask the user one short question: whether to import ${sessions === 1 ? "it" : "them"} as private records, such as "Import the ${sessions === 1 ? "earlier session" : `${sessions} earlier sessions`} into ANVC?". `
+      + `Recommend yes, and on a yes run \`${anvcCommand()} catch-up --repo ${shellWord(repo)}\`. Don't run it without one.`
+      + (files.length ? ` Files here also hold numbers, such as ${named}. After that, offer separately to record the ones the user relies on, ${how}. ${batch}` : "")
+    : `anvc is on in this repository, and work happened here before it was: files that hold numbers, such as ${named}. ANVC has none of it yet. `
+      + `Ask the user whether to bring in the numbers they rely on, ${how}. Do nothing without a yes. ${batch}`;
+  return { said, text };
+}
+
+/** Sessions on disk for this repository that ANVC has no copy of: the ones from before it was on, which catch-up imports. */
+export function earlierSessions(repo: string): number {
+  const kept = new Set(keptSessions(repo).map((k) => k.session));
+  return sessionFiles(repo).filter((s) => !kept.has(s.session)).length;
 }
 
 /**

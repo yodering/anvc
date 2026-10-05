@@ -9,8 +9,8 @@ import { Database } from "bun:sqlite";
 import { isAbsolute as isAbsolute2 } from "path";
 
 // protocol/localonly.ts
-import { existsSync as existsSync4, mkdirSync as mkdirSync3, rmSync as rmSync2, writeFileSync as writeFileSync3 } from "fs";
-import { dirname as dirname3, join as join5 } from "path";
+import { existsSync as existsSync4, mkdirSync as mkdirSync4, rmSync as rmSync2, writeFileSync as writeFileSync4 } from "fs";
+import { dirname as dirname4, join as join5 } from "path";
 
 // protocol/git.ts
 import { spawnSync } from "child_process";
@@ -303,7 +303,7 @@ function collapse(text) {
 // package.json
 var package_default = {
   name: "anvc",
-  version: "0.4.9",
+  version: "0.4.10",
   private: true,
   type: "module",
   scripts: {
@@ -341,9 +341,9 @@ var package_default = {
 
 // protocol/version.ts
 import { spawn } from "child_process";
-import { existsSync as existsSync2, readFileSync as readFileSync2, statSync } from "fs";
+import { existsSync as existsSync2, mkdirSync as mkdirSync3, readFileSync as readFileSync2, statSync, writeFileSync as writeFileSync3 } from "fs";
 import { homedir as homedir3 } from "os";
-import { delimiter, join as join3, resolve as resolve2 } from "path";
+import { delimiter, dirname as dirname3, join as join3, resolve as resolve2 } from "path";
 
 // protocol/args.ts
 function flag(argv, name, fallback) {
@@ -516,6 +516,89 @@ function version() {
 }
 var BUILT = package_default.version;
 var managedBy = () => Bun.isStandaloneExecutable ? "desktop" : existsSync2(join3(HOME, ".git")) ? "git" : "plugin";
+var LAUNCHER_MARK = "anvc-launcher";
+var LAUNCHERS = process.platform === "win32" ? ["anvc.cmd", "anvc"] : ["anvc"];
+var pointerFile = () => join3(stateHome(), "cli");
+function binDir() {
+  const [local, bun] = binDirs();
+  if (!bun)
+    return local;
+  const path = new Set((process.env.PATH ?? "").split(delimiter).filter(Boolean).map((d) => samePath(d)));
+  if (path.has(samePath(local)))
+    return local;
+  if (existsSync2(bun) && path.has(samePath(bun)))
+    return bun;
+  return process.platform === "win32" ? bun : local;
+}
+var binDirs = () => process.env.ANVC_BIN_DIR ? [process.env.ANVC_BIN_DIR] : [join3(homedir3(), ".local", "bin"), join3(process.env.BUN_INSTALL || join3(homedir3(), ".bun"), "bin")];
+var ours = (file) => readHead(file, 512)?.includes(LAUNCHER_MARK) ?? false;
+function launcherScript(name, pointer) {
+  const missing = `anvc: the ANVC command line named in ${pointer} isn't there. Start a new agent session, and it's named again.`;
+  return name.endsWith(".cmd") ? [
+    `@echo off`,
+    `rem ${LAUNCHER_MARK}: runs the ANVC command line named in the file below, which ANVC keeps current.`,
+    `setlocal`,
+    `set /p ANVC_CLI=<"${pointer}"`,
+    `if exist "%ANVC_CLI%" goto run`,
+    `echo ${missing.replace(/[&|<>^]/g, "^$&")} 1>&2`,
+    `exit /b 1`,
+    `:run`,
+    `bun "%ANVC_CLI%" %*`,
+    ``
+  ].join(`\r
+`) : [
+    `#!/bin/sh`,
+    `# ${LAUNCHER_MARK}: runs the ANVC command line named in the file below, which ANVC keeps current.`,
+    `cli=$(cat ${shellWord(pointer)} 2>/dev/null)`,
+    `if [ ! -f "$cli" ]; then`,
+    `  echo ${shellWord(missing)} >&2`,
+    `  exit 1`,
+    `fi`,
+    `exec bun "$cli" "$@"`,
+    ``
+  ].join(`
+`);
+}
+function notePointer() {
+  if (managedBy() === "desktop")
+    return;
+  try {
+    const file = pointerFile();
+    if (readHead(file, 4096) === CLI)
+      return;
+    mkdirSync3(dirname3(file), { recursive: true });
+    writeFileSync3(file, CLI);
+  } catch {}
+}
+function installLauncher(dry = false) {
+  if (managedBy() === "desktop")
+    return null;
+  if (!dry)
+    notePointer();
+  try {
+    const dir = binDir();
+    const found = which("anvc");
+    if (found && !ours(found))
+      return null;
+    const files = LAUNCHERS.map((name) => ({ file: join3(dir, name), script: launcherScript(name, pointerFile()) }));
+    if (files.some((f) => existsSync2(f.file) && !ours(f.file)))
+      return null;
+    const stale = files.filter((f) => !existsSync2(f.file) || readFileSync2(f.file, "utf8") !== f.script);
+    if (stale.length && !dry) {
+      mkdirSync3(dir, { recursive: true });
+      for (const f of stale)
+        writeFileSync3(f.file, f.script, { mode: 493 });
+    }
+    return { file: files[0].file, changed: stale.length > 0 };
+  } catch {
+    return null;
+  }
+}
+function launcherOnPath() {
+  const found = which("anvc");
+  return found !== null && binDirs().some((d) => samePath(d) === samePath(dirname3(found))) && ours(found);
+}
+var anvcCommand = () => launcherOnPath() ? "anvc" : managedBy() === "desktop" ? "bun run anvc" : `bun ${shellWord(CLI)}`;
 var GLOBAL = "*";
 var installsFile = () => join3(stateHome(), "installs.json");
 var installs = () => readJson(installsFile(), []);
@@ -601,7 +684,7 @@ function updateLine(state) {
   }
   if (!state || !state.behind)
     return null;
-  return `ANVC has ${state.behind} update${state.behind === 1 ? "" : "s"} ready. Run: bun run anvc update`;
+  return `ANVC has ${state.behind} update${state.behind === 1 ? "" : "s"} ready. Run: ${anvcCommand()} update`;
 }
 var desktopFile = () => join3(stateHome(), "desktop.json");
 function updateOffer(state) {
@@ -614,7 +697,7 @@ function updateOffer(state) {
   const desktop = readJson(desktopFile(), {}).version;
   const steps = [
     Bun.semver.order(latest, version()) > 0 ? "`claude plugin marketplace update anvc && claude plugin update anvc@anvc`, after which they start a new session" : null,
-    desktop && Bun.semver.order(latest, desktop) > 0 ? `\`bun ${shellWord(CLI)} desktop install\` for the desktop app, which is ${desktop}` : null
+    desktop && Bun.semver.order(latest, desktop) > 0 ? `\`${anvcCommand()} desktop install\` for the desktop app, which is ${desktop}` : null
   ].filter(Boolean);
   if (!steps.length)
     return null;
@@ -892,15 +975,15 @@ function setLocalOnly(repo, on) {
   if (!on) {
     rmSync2(path, { force: true });
     if (readDefaults().localOnly) {
-      mkdirSync3(dirname3(off), { recursive: true });
-      writeFileSync3(off, `Local only is off here, whatever the default.
+      mkdirSync4(dirname4(off), { recursive: true });
+      writeFileSync4(off, `Local only is off here, whatever the default.
 `);
     }
     return { unset: 0 };
   }
   rmSync2(off, { force: true });
-  mkdirSync3(dirname3(path), { recursive: true });
-  writeFileSync3(path, `Local only since ${new Date().toISOString()}. Nothing ANVC keeps is pushed or fetched.
+  mkdirSync4(dirname4(path), { recursive: true });
+  writeFileSync4(path, `Local only since ${new Date().toISOString()}. Nothing ANVC keeps is pushed or fetched.
 `);
   let unset = 0;
   for (const remote of remoteNames(repo))
@@ -2298,19 +2381,19 @@ function ingest(repo, events, opts = {}) {
 }
 
 // protocol/activity.ts
-import { appendFileSync, mkdirSync as mkdirSync4 } from "fs";
+import { appendFileSync, mkdirSync as mkdirSync5 } from "fs";
 import { homedir as homedir5 } from "os";
-import { basename as basename2, dirname as dirname4, join as join7 } from "path";
+import { basename as basename2, dirname as dirname5, join as join7 } from "path";
 var dir = () => process.env.ANVC_ACTIVITY_DIR ?? join7(homedir5(), ".anvc", "activity");
 function repoRoot(cwd) {
   const common = gitOrNull(cwd, ["rev-parse", "--path-format=absolute", "--git-common-dir"]);
   if (common?.endsWith("/.git"))
-    return dirname4(common);
+    return dirname5(common);
   return gitOrNull(cwd, ["rev-parse", "--show-toplevel"]) || null;
 }
 function appendDaily(dir, row) {
   try {
-    mkdirSync4(dir, { recursive: true, mode: 448 });
+    mkdirSync5(dir, { recursive: true, mode: 448 });
     const day = new Date().toISOString().slice(0, 10);
     appendFileSync(join7(dir, `${day}.jsonl`), `${JSON.stringify({ ts: new Date().toISOString(), ...row })}
 `, { mode: 384 });
@@ -2427,7 +2510,7 @@ function allActivity(repo) {
 }
 
 // protocol/agents.ts
-import { closeSync as closeSync2, mkdirSync as mkdirSync5, openSync as openSync2, readFileSync as readFileSync5, readSync as readSync2, statSync as statSync2, writeFileSync as writeFileSync4 } from "fs";
+import { closeSync as closeSync2, mkdirSync as mkdirSync6, openSync as openSync2, readFileSync as readFileSync5, readSync as readSync2, statSync as statSync2, writeFileSync as writeFileSync5 } from "fs";
 import { homedir as homedir6 } from "os";
 import { join as join9 } from "path";
 
@@ -2540,8 +2623,8 @@ function noteSession(agent, repo, session) {
       return;
     all[key] = { session, ts: new Date().toISOString() };
     const file = sessionsFile();
-    mkdirSync5(join9(file, ".."), { recursive: true });
-    writeFileSync4(file, JSON.stringify(all));
+    mkdirSync6(join9(file, ".."), { recursive: true });
+    writeFileSync5(file, JSON.stringify(all));
   } catch {}
 }
 function currentSession(agent, repo) {
@@ -2800,7 +2883,7 @@ function errorLine(output) {
 
 // protocol/recheck.ts
 import { createHash as createHash3 } from "crypto";
-import { mkdirSync as mkdirSync6, writeFileSync as writeFileSync5 } from "fs";
+import { mkdirSync as mkdirSync7, writeFileSync as writeFileSync6 } from "fs";
 import { join as join10 } from "path";
 var COMMANDS = [
   "bun test",
@@ -2867,8 +2950,8 @@ function verifyCached(repo, command) {
   cache[key] = { result, ts: new Date().toISOString() };
   const entries = Object.entries(cache).sort((a, b) => b[1].ts.localeCompare(a[1].ts)).slice(0, 200);
   try {
-    mkdirSync6(join10(cacheFile(), ".."), { recursive: true });
-    writeFileSync5(cacheFile(), JSON.stringify(Object.fromEntries(entries)));
+    mkdirSync7(join10(cacheFile(), ".."), { recursive: true });
+    writeFileSync6(cacheFile(), JSON.stringify(Object.fromEntries(entries)));
   } catch {}
   return result;
 }
@@ -2973,8 +3056,8 @@ function whyLine(db, repo, path, line) {
 
 // protocol/results.ts
 import { createHash as createHash4 } from "crypto";
-import { closeSync as closeSync3, lstatSync, mkdirSync as mkdirSync8, openSync as openSync3, readdirSync as readdirSync2, readFileSync as readFileSync6, readSync as readSync3, rmSync as rmSync3, statSync as statSync4, writeFileSync as writeFileSync6 } from "fs";
-import { dirname as dirname6, join as join12, resolve as resolve4 } from "path";
+import { closeSync as closeSync3, lstatSync, mkdirSync as mkdirSync9, openSync as openSync3, readdirSync as readdirSync2, readFileSync as readFileSync6, readSync as readSync3, rmSync as rmSync3, statSync as statSync4, writeFileSync as writeFileSync7 } from "fs";
+import { dirname as dirname7, join as join12, resolve as resolve4 } from "path";
 
 // protocol/retire.ts
 function headAnchor(repo) {
@@ -3190,8 +3273,8 @@ function runFiles(command, cwd, repo) {
 }
 
 // protocol/runlog.ts
-import { appendFileSync as appendFileSync2, mkdirSync as mkdirSync7 } from "fs";
-import { dirname as dirname5, join as join11 } from "path";
+import { appendFileSync as appendFileSync2, mkdirSync as mkdirSync8 } from "fs";
+import { dirname as dirname6, join as join11 } from "path";
 var runsDir = (repo) => join11(captureRoot(), "runs", repoKey(repo));
 var runsFiles = (repo) => jsonl(runsDir(repo));
 
@@ -3283,7 +3366,7 @@ async function trackRun(command, cwd = process.cwd()) {
     } catch {}
   }
   const file = join11(runsDir(repo), `${row.ts.toString().slice(0, 10)}.jsonl`);
-  mkdirSync7(dirname5(file), { recursive: true, mode: 448 });
+  mkdirSync8(dirname6(file), { recursive: true, mode: 448 });
   appendFileSync2(file, `${JSON.stringify(row)}
 `, { mode: 384 });
   return { code, logged: true, files };
@@ -3379,8 +3462,8 @@ function savePrints() {
     return;
   const entries = [...cached.entries()].slice(-5000);
   try {
-    mkdirSync8(dirname6(printsFile()), { recursive: true });
-    writeFileSync6(printsFile(), JSON.stringify(Object.fromEntries(entries)));
+    mkdirSync9(dirname7(printsFile()), { recursive: true });
+    writeFileSync7(printsFile(), JSON.stringify(Object.fromEntries(entries)));
   } catch {}
 }
 function folderPrint(root) {
@@ -4325,8 +4408,8 @@ function withoutMoves(repo, lines) {
 }
 
 // protocol/goals.ts
-import { existsSync as existsSync7, mkdirSync as mkdirSync9, rmSync as rmSync4, writeFileSync as writeFileSync7 } from "fs";
-import { dirname as dirname7 } from "path";
+import { existsSync as existsSync7, mkdirSync as mkdirSync10, rmSync as rmSync4, writeFileSync as writeFileSync8 } from "fs";
+import { dirname as dirname8 } from "path";
 var GOAL_LABELS = { todo: "To do", doing: "In progress", done: "Done", dropped: "Dropped" };
 var approvalOn = (repo) => {
   const path = marker(repo, "approve-goals");
@@ -4340,8 +4423,8 @@ function setApproval(repo, on) {
     rmSync4(path, { force: true });
     return;
   }
-  mkdirSync9(dirname7(path), { recursive: true });
-  writeFileSync7(path, `Goals an agent adds or changes wait for the person to accept them.
+  mkdirSync10(dirname8(path), { recursive: true });
+  writeFileSync8(path, `Goals an agent adds or changes wait for the person to accept them.
 `);
 }
 var proposes = (repo, actor) => actor.kind === "agent" && approvalOn(repo);
@@ -5663,8 +5746,8 @@ function statusCommand(repo, positional, argv) {
 // protocol/open.ts
 import { spawn as spawn2 } from "child_process";
 import { randomBytes as randomBytes2, timingSafeEqual } from "crypto";
-import { closeSync as closeSync4, existsSync as existsSync9, mkdirSync as mkdirSync10, openSync as openSync4, readFileSync as readFileSync11 } from "fs";
-import { dirname as dirname8, join as join15 } from "path";
+import { closeSync as closeSync4, existsSync as existsSync9, mkdirSync as mkdirSync11, openSync as openSync4, readFileSync as readFileSync11 } from "fs";
+import { dirname as dirname9, join as join15 } from "path";
 var CLONE_SERVER = join15(HOME, "server", "inspect.ts");
 var SERVER = existsSync9(CLONE_SERVER) ? CLONE_SERVER : join15(HOME, "dist", "inspect.js");
 var PORTS = "7451-7470";
@@ -5699,10 +5782,10 @@ async function ask(port, top) {
 }
 async function startServer(top, ports) {
   const log = place2(top, "log");
-  mkdirSync10(dirname8(log), { recursive: true, mode: 448 });
+  mkdirSync11(dirname9(log), { recursive: true, mode: 448 });
   const out = openSync4(log, "w", 384);
   const child = spawn2(process.execPath, [SERVER, "--repo", top, "--port", ports], {
-    cwd: dirname8(SERVER),
+    cwd: dirname9(SERVER),
     detached: true,
     stdio: ["ignore", out, out],
     windowsHide: true,
@@ -5765,9 +5848,9 @@ async function openWorkLog(folder, options = {}) {
 }
 
 // protocol/sources.ts
-import { appendFileSync as appendFileSync3, mkdirSync as mkdirSync11 } from "fs";
+import { appendFileSync as appendFileSync3, mkdirSync as mkdirSync12 } from "fs";
 import { createHash as createHash5, randomBytes as randomBytes3 } from "crypto";
-import { dirname as dirname9, join as join16, resolve as resolve7 } from "path";
+import { dirname as dirname10, join as join16, resolve as resolve7 } from "path";
 var MAX_SOURCE = 64 * 1024;
 var MAX_ASKED = 2000;
 var MAX_READ = 4 * 1024 * 1024;
@@ -5857,7 +5940,7 @@ ${text ?? ""}`).digest("hex").slice(0, 16);
   });
   if (!rows.length)
     return 0;
-  mkdirSync11(dirname9(file), { recursive: true, mode: 448 });
+  mkdirSync12(dirname10(file), { recursive: true, mode: 448 });
   appendFileSync3(file, rows.map((r) => JSON.stringify(r)).join(`
 `) + `
 `, { mode: 384 });
@@ -6316,7 +6399,7 @@ async function openTool() {
     return unknownRepo;
   try {
     const o = await openWorkLog(repo);
-    return o.browser ? `Opened the work log for ${o.repo} in the browser, at ${o.url}.` : `The work log for ${o.repo} is on ${o.url}. There's no display here to open it on. For a link that signs in, the person can run anvc open --no-browser in a terminal.`;
+    return o.browser ? `Opened the work log for ${o.repo} in the browser, at ${o.url}.` : `The work log for ${o.repo} is on ${o.url}. There's no display here to open it on. For a link that signs in, the person can run ${anvcCommand()} open --no-browser in a terminal.`;
   } catch (error) {
     return error instanceof Error ? error.message : String(error);
   }
@@ -6505,7 +6588,7 @@ ${raw.map((r) => `  ${r.ts.slice(0, 16).replace("T", " ")} ${r.agent}${r.ok === 
     }
     case "anvc_result": {
       if (dataMode(repo).mode === "off")
-        return "Keeping track of results is off for this project. The person can turn it on in Settings or with: anvc data results";
+        return `Keeping track of results is off for this project. The person can turn it on in Settings or with: ${anvcCommand()} data results`;
       const actor = { kind: "agent", agent: agentName2, session: runId() };
       const status = typeof args.status === "string" ? args.status : undefined;
       if (typeof args.of === "string" && args.of) {
@@ -6513,7 +6596,7 @@ ${raw.map((r) => `  ${r.ts.slice(0, 16).replace("T", " ")} ${r.agent}${r.ok === 
           return "Give the new status with of.";
         recordStatus(repo, args.of, status, String(args.why ?? ""), actor);
         const view = listResults(repo).find((r) => r.id === args.of);
-        return view.proposed ? `Proposed marking ${view.name} ${status}. It is ${view.status} until the person decides: anvc result ${status === "locked" ? "lock" : status} ${view.id}` : `${view.name} is now ${view.status}.`;
+        return view.proposed ? `Proposed marking ${view.name} ${status}. It is ${view.status} until the person decides: ${anvcCommand()} result ${status === "locked" ? "lock" : status} ${view.id}` : `${view.name} is now ${view.status}.`;
       }
       const strings = (x) => Array.isArray(x) ? x.filter((v) => typeof v === "string") : undefined;
       const save = (r) => {
@@ -6633,7 +6716,7 @@ ${found.elsewhere.slice(0, 5).map((f) => `- ${f.path} \u2192 ${f.key} = ${f.foun
         session: runId(),
         agent: agentName2
       }));
-      const said = result.state === "retired" ? `Retired ${String(args.record)}. It is no longer shown to agents. The person can restore it with: anvc retire restore ${String(args.record)}` : `Proposed retiring ${String(args.record)}. Nothing changes until the person approves it with: anvc retire approve ${String(args.record)}
+      const said = result.state === "retired" ? `Retired ${String(args.record)}. It is no longer shown to agents. The person can restore it with: ${anvcCommand()} retire restore ${String(args.record)}` : `Proposed retiring ${String(args.record)}. Nothing changes until the person approves it with: ${anvcCommand()} retire approve ${String(args.record)}
 Tell them you proposed it and why.`;
       return `${said}
   ${result.checked}

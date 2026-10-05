@@ -14,13 +14,13 @@
 import { existsSync, readdirSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
-import { AGENT_NAMES, installedAgents } from "./agents";
+import { AGENT_NAMES, AGENTS, installedAgents } from "./agents";
 import { shellWord } from "./args";
 import { folderOn } from "./folders";
 import { setupEverywhere, setupProject } from "./options";
-import { readJson, samePath, writeJson } from "./rawlog";
+import { isRepo, readJson, samePath, writeJson } from "./rawlog";
 import { tilde } from "./tools";
-import { claudeDir, GLOBAL, installs, stateHome } from "./version";
+import { anvcCommand, claudeDir, GLOBAL, installs, stateHome } from "./version";
 
 /**
  * How far a search goes: two levels below each folder, and it stops at 200
@@ -86,12 +86,27 @@ export function findRepos(roots: string[], limits = LIMITS): { repos: string[]; 
   return { repos: repos.sort(), stopped };
 }
 
+/** Whether a Claude Code settings file turns the ANVC plugin on. */
+const pluginOn = (file: string) => readJson<{ enabledPlugins?: Record<string, unknown> } | null>(file, null)?.enabledPlugins?.["anvc@anvc"] === true;
+
 /** The agents ANVC is installed for in every project: setup --global, or the Claude Code plugin enabled for the person. */
 function everywhereAgents(): string[] {
   const agents = new Set(installs().filter((i) => i.repo === GLOBAL).map((i) => i.agent));
-  const settings = readJson<{ enabledPlugins?: Record<string, unknown> } | null>(join(claudeDir(), "settings.json"), null);
-  if (settings?.enabledPlugins?.["anvc@anvc"] === true) agents.add("claude-code");
+  if (pluginOn(join(claudeDir(), "settings.json"))) agents.add("claude-code");
   return [...agents];
+}
+
+/**
+ * The agents whose ANVC hooks run in this repository: set up for every
+ * project or for this one, or the Claude Code plugin turned on for the person
+ * or the project and installed.
+ */
+export function connectedAgents(repo: string): string[] {
+  const here = isRepo(repo);
+  const agents = new Set(installs().filter((i) => i.repo === GLOBAL || here(i.repo)).map((i) => i.agent));
+  const installed = readJson<{ plugins?: Record<string, unknown> } | null>(join(claudeDir(), "plugins", "installed_plugins.json"), null)?.plugins?.["anvc@anvc"];
+  if (installed && [join(claudeDir(), "settings.json"), join(repo, ".claude", "settings.json"), join(repo, ".claude", "settings.local.json")].some(pluginOn)) agents.add("claude-code");
+  return AGENTS.filter((a) => agents.has(a));
 }
 
 /** The agents setup connects: the ones set up one project at a time, else every one installed here. */
@@ -142,6 +157,6 @@ export function foundView(known: string[], setup: boolean): FoundView {
       state: everywhere.length ? "everywhere" : alone.has(repo) ? "project" : "none",
       command: run(setupProject(repo, agents)),
     })),
-    commands: { everywhere: run(setupEverywhere(agents)), remove: "bun run anvc uninstall --everywhere" },
+    commands: { everywhere: run(setupEverywhere(agents)), remove: `${anvcCommand()} uninstall --everywhere` },
   };
 }

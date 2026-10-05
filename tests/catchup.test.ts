@@ -44,9 +44,10 @@ test("the first session after ANVC is turned on offers to bring in what came bef
   const { repo, env } = project();
   const start = (session: string) => context("SessionStart", { hook_event_name: "SessionStart", session_id: session, cwd: repo, source: "startup" }, env) ?? "";
   const first = start("s1");
-  expect(first).toContain("work happened here before it was: 1 earlier agent session and files that hold numbers, such as `results/run.json`");
-  expect(first).toContain("catch-up --repo");
-  expect(first).toContain("Do neither without a yes.");
+  // The sessions come first, in one short question with yes recommended; the numbers after.
+  expect(first).toContain("1 earlier agent session here isn't in it yet. In your next reply, first ask the user one short question: whether to import it as private records");
+  expect(first).toMatch(/Recommend yes, and on a yes run `.+ catch-up --repo .+`\. Don't run it without one\./);
+  expect(first).toContain("Files here also hold numbers, such as `results/run.json`. After that, offer separately");
   // Files hold numbers here, so the agent is told to record its own as it goes.
   expect(first).toContain("record it with anvc_result");
   const second = start("s2");

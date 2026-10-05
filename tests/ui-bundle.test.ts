@@ -13,6 +13,7 @@ import { existsSync, mkdirSync, readFileSync, realpathSync, statSync, writeFileS
 import { join, resolve } from "node:path";
 import type { Options } from "../protocol/options";
 import { shellWord } from "../protocol/args";
+import { anvcCommand } from "../protocol/version";
 import { git, gitRepo, tmp, tool, uiFetch, uiPost } from "./helpers";
 
 const SERVER = resolve(import.meta.dir, "../server/inspect.ts");
@@ -175,7 +176,7 @@ test("without the token, the API answers 401 and a page says how to open it", as
     expect(page.status).toBe(401);
     const text = await page.text();
     expect(text).toContain("/anvc:open");
-    expect(text).toContain("bun run anvc open");
+    expect(text).toContain(`${anvcCommand()} open</code> in a terminal`);
     expect(text).not.toContain('id="root"');
     // A wrong one, in either place, is the same as none.
     expect((await fetch(`${origin}/api/repo`, { headers: { "x-anvc-token": "wrong" } })).status).toBe(401);

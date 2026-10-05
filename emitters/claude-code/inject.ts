@@ -65,7 +65,8 @@ import { handoff } from "../../protocol/handoff";
 import { changedLines } from "../../protocol/drift";
 import { checkResult, dataMode, describe, listResults, sameNumber, type ResultView } from "../../protocol/results";
 import { catchUpOffer, dataFiles, dataLine, holdsNumbers, isDataPath, RECORD_RESULT, writtenData } from "../../protocol/catchup";
-import { readUpdate, updateOffer } from "../../protocol/version";
+import { anvcCommand, installLauncher, readUpdate, updateOffer } from "../../protocol/version";
+import { refreshPrePush } from "../../protocol/prepush";
 import { cachedCheck, runnable, verifyCached } from "../../protocol/recheck";
 import { autosave } from "../../protocol/autosave";
 import { readAssist, type Moment } from "../../protocol/assist";
@@ -468,6 +469,12 @@ try {
     // `clear`, `resume` and `fork` are the same shape: the context is gone,
     // the session id is not.
     const source = String(payload.source ?? "startup");
+    // The anvc command runs whichever copy started a session last, so after
+    // an update it runs the new one. Someone who set up before there was a
+    // launcher gets it here, and a push check that named the version gone
+    // after an update is written again.
+    installLauncher();
+    refreshPrePush(root);
     // Sessions that ended without a record, and whose end never arrived (a
     // closed terminal, a crash), are saved from the raw log now. See
     // protocol/autosave.ts.
@@ -518,7 +525,7 @@ try {
       // is said whatever the count; nothing else would say why the team's
       // records are missing.
       const untravelled = recordsTravel(repo) === false
-        ? "anvc: records in this repository do not travel with git push and fetch yet, so the team's records are missing here. Tell the user to run /anvc:init (or bun run anvc init)."
+        ? `anvc: records in this repository do not travel with git push and fetch yet, so the team's records are missing here. Tell the user to run /anvc:init (or ${anvcCommand()} init).`
         : null;
       // Results that need a look: something a locked or current one depends on
       // changed, or a decision waits for the person. The rest are one query away.
