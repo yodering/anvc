@@ -44,6 +44,16 @@ test("a new session is told what the one before left, and where to read more", a
   expect(note).toContain("/home/u/.codex/sessions/rollout-x.jsonl");
 });
 
+test("a search that found nothing isn't the last failure", async () => {
+  const { repo, capture, write } = await setup();
+  await write([
+    row(repo, { tool: "Bash", command: "bun test", ok: false, output: "1 fail: ssl context" }),
+    row(repo, { tool: "Bash", command: "ugrep -n 'foo(' src | head", ok: false, output: "ugrep: error: missing )" }),
+    row(repo, { tool: "Bash", command: "ls missing/", ok: false, output: "ls: cannot access" }),
+  ]);
+  expect(handoff(repo, "claude-2", { captureDir: capture })).toContain("Last failure: `bun test`");
+});
+
 test("nothing is said about the session itself, or one that left nothing behind", async () => {
   const { repo, capture, write } = await setup();
   await write([

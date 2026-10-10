@@ -23,7 +23,7 @@ import { prePushOn } from "./prepush";
 import { samePath } from "./rawlog";
 import { DATA_MODES, DEFAULT_DATA_MODE, dataMode, everywhereDataMode } from "./results";
 import { ABSORB_MODES, absorbMode, ABSORB_COST, DEFAULT_ABSORB_MODE } from "./absorb";
-import { anvcCommand, GLOBAL, installs, managedBy, SETUP } from "./version";
+import { anvcCommand, GLOBAL, installs, managedBy, SETUP, updateMode, updateModeChosen } from "./version";
 
 type Value = string | string[] | null;
 
@@ -203,7 +203,8 @@ export function options(root: string | null, cwd: string): Options {
     const on = prePushOn(work);
     settings.push({
       key: "prepush", name: "Push check", what: "Before each push, says what it shares and stops one that holds a secret.",
-      here: onOff(on), recommended: "off", chosen: on, asks: true,
+      // On wherever records travel: then each push says what it sends.
+      here: onOff(on), recommended: root && !local && recordsTravel(root) !== null ? "on" : "off", chosen: on, asks: true,
       choices: ON_OFF.map(([value, label]) => ({ value, label, set: anvc(`push-check ${value}`) })),
     });
   }
@@ -223,6 +224,16 @@ export function options(root: string | null, cwd: string): Options {
       key: "approvegoals", name: "Approve goals", what: "When on, a goal an agent adds or changes waits until you accept it.",
       here: onOff(on), recommended: "off", chosen: on, asks: false,
       choices: ON_OFF.map(([value, label]) => ({ value, label, set: anvc(`approve-goals ${value}`) })),
+    });
+  }
+
+  // For the whole computer, and only for the plugin: a clone is updated with
+  // anvc update, and the desktop app by installing it again.
+  if (managedBy() === "plugin") {
+    settings.push({
+      key: "updates", name: "Updates", what: "Automatic installs a release once it's been out two days with nothing newer.",
+      here: updateMode(), recommended: "auto", chosen: updateModeChosen(), asks: false,
+      choices: [{ value: "auto", label: "Automatic", set: anvc("updates auto") }, { value: "ask", label: "Ask first", set: anvc("updates ask") }],
     });
   }
 

@@ -92165,7 +92165,7 @@ function collapse(text) {
 // package.json
 var package_default = {
   name: "anvc",
-  version: "0.4.10",
+  version: "0.4.11",
   private: true,
   type: "module",
   scripts: {
@@ -92505,7 +92505,9 @@ function checkForUpdate(home = HOME) {
       windowsHide: true
     });
     const latest = tags.success ? newestTag(tags.stdout.toString()) : null;
-    return save(latest ? { checked, behind: 0, changes: [], latest } : { checked, behind: 0, changes: [], error: "couldn't reach the anvc repository" });
+    const before = readJson(updateFile(), null);
+    const since = before?.latest === latest && before?.since ? before.since : checked;
+    return save(latest ? { ...before, checked, behind: 0, changes: [], latest, since, error: undefined } : { ...before, checked, behind: 0, changes: [], error: "couldn't reach the anvc repository" });
   }
   const upstream = gitOrNull(home, ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"]);
   if (!upstream)
@@ -92540,9 +92542,33 @@ function checkDaily() {
     spawn("bun", [CLI, "update", "--check"], { detached: true, stdio: "ignore", windowsHide: true }).on("error", () => {}).unref();
   } catch {}
 }
+var modeFile = () => join3(stateHome(), "updates.json");
+var updateMode = () => readJson(modeFile(), {}).mode === "ask" ? "ask" : "auto";
+var updateModeChosen = () => existsSync2(modeFile());
+var setUpdateMode = (mode) => writeJson(modeFile(), { mode });
+var SETTLE_MS = 2 * 86400000;
+function settlesAt(state, current) {
+  if (!state?.latest || !state.since || Bun.semver.order(state.latest, current) <= 0)
+    return null;
+  return Date.parse(state.since) + SETTLE_MS;
+}
+function autoUpdate(state, now = Date.now()) {
+  const at = settlesAt(state, version());
+  if (managedBy() !== "plugin" || updateMode() !== "auto" || at === null || now < at)
+    return state;
+  const done = updatePlugin();
+  if (!done)
+    return state;
+  const ts = new Date(now).toISOString();
+  return save({ ...state, installed: "error" in done ? { error: done.error, ts } : { from: done.from, to: done.to, ts } });
+}
 function updateLine(state) {
   if (state?.latest && Bun.semver.order(state.latest, version()) > 0) {
-    return `ANVC ${state.latest} is out, and this is ${version()}. To update, run in a terminal: claude plugin marketplace update anvc && claude plugin update anvc@anvc, then start a new session.`;
+    if (state.installed?.to === state.latest)
+      return `ANVC ${state.latest} is installed. A new session runs it.`;
+    const at = updateMode() === "auto" ? settlesAt(state, version()) : null;
+    const when = at !== null && at > Date.now() ? ` It installs itself on ${new Date(at).toLocaleDateString("en-GB", { day: "numeric", month: "short" })}, two days after it came out, unless a newer one follows.` : "";
+    return `ANVC ${state.latest} is out, and this is ${version()}.${when} To update now, run in a terminal: claude plugin marketplace update anvc && claude plugin update anvc@anvc, then start a new session.`;
   }
   if (!state || !state.behind)
     return null;
@@ -92557,14 +92583,16 @@ function updateOffer(state) {
   if (readJson(file, {}).offered === latest)
     return null;
   const desktop = readJson(desktopFile(), {}).version;
+  const auto = managedBy() === "plugin" && updateMode() === "auto";
   const steps = [
-    Bun.semver.order(latest, version()) > 0 ? "`claude plugin marketplace update anvc && claude plugin update anvc@anvc`, after which they start a new session" : null,
+    !auto && Bun.semver.order(latest, version()) > 0 ? "`claude plugin marketplace update anvc && claude plugin update anvc@anvc`, after which they start a new session" : null,
     desktop && Bun.semver.order(latest, desktop) > 0 ? `\`${anvcCommand()} desktop install\` for the desktop app, which is ${desktop}` : null
   ].filter(Boolean);
-  if (!steps.length)
+  const moved = auto && state?.installed?.to === latest && version() === latest ? `ANVC updated itself from ${state.installed.from} to ${latest}. Tell the person in one line.` : null;
+  if (!steps.length && !moved)
     return null;
   return {
-    text: `anvc: ANVC ${latest} is out. Ask the person whether to update, and if they say yes, run ${steps.join(", and ")}.`,
+    text: `anvc: ${[moved, steps.length ? `ANVC ${latest} is out. Ask the person whether to update, and if they say yes, run ${steps.join(", and ")}.` : null].filter(Boolean).join(" ")}`,
     said: () => {
       try {
         writeJson(file, { offered: latest });
@@ -94206,11 +94234,11 @@ function flags(command) {
   }
   return out;
 }
-var READERS = new Set(["cat", "bat", "head", "tail", "less", "more", "grep", "egrep", "fgrep", "rg", "ag", "ack", "ls", "tree", "find", "fd", "wc", "sed", "echo", "printf", "sort", "uniq", "cut", "tr", "column", "diff", "cmp", "jq", "yq", "file", "stat", "du", "df", "git", "gh", "curl", "wget"]);
+var READERS = new Set(["cat", "bat", "head", "tail", "less", "more", "grep", "egrep", "fgrep", "rg", "ugrep", "ug", "ag", "ack", "ls", "tree", "find", "fd", "wc", "sed", "echo", "printf", "sort", "uniq", "cut", "tr", "column", "diff", "cmp", "jq", "yq", "file", "stat", "du", "df", "git", "gh", "curl", "wget"]);
 var KEYWORDS = new Set(["until", "while", "do", "then", "else", "elif", "if", "!", "{", "("]);
 var QUIET = new Set(["cd", "pushd", "popd", "sleep", "done", "fi", "for", "[", "[[", "test", "true", "false", "export", "set", "mkdir", "rm", "cp", "mv", "touch", "pgrep", "pkill", "kill", "wait", "exit", "}", ")"]);
 var PREFIXES = new Set(["sudo", "time", "env", "nice", "command", "exec", "xargs"]);
-function onlyReads(command) {
+function onlyReads(command, readers = READERS) {
   let read = false;
   for (const line of command.split(`
 `)) {
@@ -94226,13 +94254,15 @@ function onlyReads(command) {
       const program = w.split("/").at(-1);
       if (QUIET.has(program))
         continue;
-      if (!READERS.has(program))
+      if (!readers.has(program))
         return false;
       read = true;
     }
   }
   return read;
 }
+var LOOKUPS = new Set(["cat", "bat", "head", "tail", "less", "grep", "egrep", "fgrep", "rg", "ugrep", "ug", "ag", "ack", "ls", "tree", "find", "fd", "wc", "stat", "file", "which", "type", "du", "jq", "yq", "sort", "uniq", "cut", "column"]);
+var onlyLooks = (command) => onlyReads(command, LOOKUPS);
 function mainStep(command) {
   const steps = command.split(/\s*(?:&&|\|\||;|\||\n)\s*/).map((s) => s.trim()).filter(Boolean);
   for (const step of steps) {
@@ -94614,7 +94644,7 @@ function setDataMode(repo, mode) {
 var FULL_HASH_BYTES = 64 * 1024 * 1024;
 var SAMPLE_BYTES = 1024 * 1024;
 var MAX_FOLDER_FILES = 5000;
-function fingerprint(path) {
+function fingerprint(path, every = false) {
   let stat;
   try {
     stat = statSync3(path);
@@ -94622,7 +94652,7 @@ function fingerprint(path) {
     return null;
   }
   if (stat.isDirectory())
-    return folderPrint(path);
+    return folderPrint(path, every);
   const cache = prints();
   const known = cache.get(path);
   if (known && known.bytes === stat.size && known.mtime === stat.mtimeMs)
@@ -94670,9 +94700,8 @@ function savePrints() {
     writeFileSync5(printsFile(), JSON.stringify(Object.fromEntries(entries)));
   } catch {}
 }
-function folderPrint(root) {
-  const h = createHash3("sha256");
-  let bytes = 0, files = 0;
+function folderFiles(root, every = false) {
+  const files = [];
   const base = samePath(root);
   const walk = (dir) => {
     let names = [];
@@ -94682,7 +94711,7 @@ function folderPrint(root) {
       return;
     }
     for (const name of names) {
-      if (files >= MAX_FOLDER_FILES || name === ".git" || name === "node_modules")
+      if (files.length >= MAX_FOLDER_FILES || name === ".git" || name === "node_modules")
         continue;
       const path = join9(dir, name);
       let stat;
@@ -94698,18 +94727,31 @@ function folderPrint(root) {
         continue;
       }
       if (stat.isDirectory()) {
-        walk(path);
+        if (every || !skipDir(name))
+          walk(path);
         continue;
       }
-      files++;
-      bytes += stat.size;
-      h.update(`${below(root, path)}\x00${stat.size}\x00`);
-      if (stat.size <= 256 * 1024)
-        h.update(readFileSync4(path));
+      if (!every && /\.py[co]$|^\.DS_Store$/.test(name))
+        continue;
+      files.push({ path, size: stat.size, mtime: stat.mtimeMs });
     }
   };
   walk(root);
-  return { hash: `${files >= MAX_FOLDER_FILES ? "folder-partial" : "folder"}:${h.digest("hex")}`, bytes };
+  return { files, partial: files.length >= MAX_FOLDER_FILES };
+}
+function folderPrint(root, every = false) {
+  const h = createHash3("sha256");
+  const { files, partial } = folderFiles(root, every);
+  for (const f of files) {
+    h.update(`${below(root, f.path)}\x00${f.size}\x00`);
+    if (f.size <= 256 * 1024)
+      h.update(readFileSync4(f.path));
+  }
+  const name = every ? "folder" : "files";
+  return { hash: `${partial ? `${name}-partial` : name}:${h.digest("hex")}`, bytes: files.reduce((n, f) => n + f.size, 0) };
+}
+function newerIn(root, since) {
+  return folderFiles(root).files.filter((f) => f.mtime > since).sort((a, b) => b.mtime - a.mtime).slice(0, 3).map((f) => below(root, f.path));
 }
 function parseJson(text) {
   try {
@@ -94768,6 +94810,31 @@ function rowsNamed(rows, name) {
     return rows.slice(1).filter((r) => r[0] === name);
   return rows.slice(1).filter((r) => pairs.every(([col, v]) => r[col] === v));
 }
+function cellAt(rows, key) {
+  for (let at = key.indexOf("/");at >= 0; at = key.indexOf("/", at + 1)) {
+    const col = rows[0]?.indexOf(key.slice(at + 1)) ?? -1;
+    const hits = col >= 0 ? rowsNamed(rows, key.slice(0, at)) : [];
+    if (hits.length === 1 && hits[0][col] !== undefined)
+      return hits[0][col];
+  }
+  return null;
+}
+function markdownTables(text) {
+  const tables = [];
+  let rows = [];
+  for (const line of [...text.split(/\r?\n/), ""]) {
+    if (!/^\s*\|.*\|\s*$/.test(line)) {
+      if (rows.length > 1)
+        tables.push(rows);
+      rows = [];
+      continue;
+    }
+    const cells = line.trim().slice(1, -1).split("|").map((c) => c.trim().replace(/^[*_`]+|[*_`]+$/g, ""));
+    if (!cells.every((c) => /^:?-+:?$/.test(c)))
+      rows.push(cells);
+  }
+  return tables;
+}
 function readValue(path, key) {
   const text = readSmall(path, 16 * 1024 * 1024);
   if (text === null)
@@ -94785,15 +94852,12 @@ function readValue(path, key) {
       return null;
     }
   }
-  if (/\.(csv|tsv)$/i.test(path) && key.includes("/")) {
-    const rows = table(path, text);
-    for (let at = key.indexOf("/");at >= 0; at = key.indexOf("/", at + 1)) {
-      const col = rows[0]?.indexOf(key.slice(at + 1)) ?? -1;
-      const hits = col >= 0 ? rowsNamed(rows, key.slice(0, at)) : [];
-      if (hits.length === 1 && hits[0][col] !== undefined)
-        return hits[0][col];
-    }
-    return null;
+  if (/\.(csv|tsv)$/i.test(path) && key.includes("/"))
+    return cellAt(table(path, text), key);
+  if (/\.(md|markdown)$/i.test(path) && key.includes("/")) {
+    const hits = markdownTables(text).map((rows) => cellAt(rows, key)).filter((v) => v !== null);
+    if (hits.length)
+      return hits.length === 1 ? hits[0] : null;
   }
   const line = text.split(/\r?\n/).find((l) => l.includes(key));
   const after = line ? line.slice(line.indexOf(key) + key.length) : "";
@@ -95021,20 +95085,25 @@ function listResults(repo) {
   }
   return [...roots.values()].sort((a, b) => b.ts.localeCompare(a.ts));
 }
-var fingerprintInside = (repo, path) => {
+var fingerprintInside = (repo, path, every = false) => {
   const real = realInside(repo, path);
-  return real ? fingerprint(real) : null;
+  return real ? fingerprint(real, every) : null;
 };
 var stateOf = (repo, path, hash) => {
   if (!hash)
     return "unknown";
-  const now = fingerprintInside(repo, path);
+  const now = fingerprintInside(repo, path, hash.startsWith("folder"));
   return !now ? "missing" : now.hash === hash ? "same" : "changed";
 };
 function checkResult(repo, view, all) {
   const real = view.source && realInside(repo, view.source.path);
   const source = view.source ? { state: stateOf(repo, view.source.path, view.source.hash), now: view.source.key && real ? readValue(real, view.source.key) : null } : null;
-  const depends = view.depends.map((d) => ({ path: d.path, state: stateOf(repo, d.path, d.hash) }));
+  const depends = view.depends.map((d) => {
+    const state = stateOf(repo, d.path, d.hash);
+    const real = state === "changed" && realInside(repo, d.path);
+    const newer = real && statSync3(real).isDirectory() ? newerIn(real, Date.parse(view.ts)) : [];
+    return { path: d.path, state, ...newer.length ? { newer } : {} };
+  });
   const everyone = all ?? listResults(repo);
   const derived = view.derived_from.map((id) => {
     const from = everyone.find((r) => r.id === id);
@@ -95061,7 +95130,7 @@ function describe(view, check, all = []) {
   if (view.command)
     lines.push(`  made by: ${view.command}${Object.keys(view.settings).length ? ` \xB7 ${Object.entries(view.settings).map(([k, v]) => `${k}=${v}`).join(", ")}` : ""}`);
   if (check.depends.length) {
-    lines.push(`  depends on: ${check.depends.map((d) => `${d.path} ${d.state === "same" ? "unchanged" : d.state === "changed" ? "CHANGED" : d.state === "missing" ? "missing" : "?"}`).join(", ")}`);
+    lines.push(`  depends on: ${check.depends.map((d) => `${d.path} ${d.state === "same" ? "unchanged" : d.state === "changed" ? `CHANGED${d.newer ? ` (newer: ${d.newer.join(", ")})` : ""}` : d.state === "missing" ? "missing" : "?"}`).join(", ")}`);
   }
   if (check.derived.length)
     lines.push(`  computed from: ${check.derived.map((d) => `${d.name} (${d.status})`).join(", ")}`);
@@ -95100,6 +95169,30 @@ function logRows(repo) {
 function producer(repo, path) {
   return logRows(repo).filter((r) => r.outputs?.some((o) => o.path === path)).at(-1) ?? null;
 }
+function tableValues(rows) {
+  const out = [];
+  const header = rows[0] ?? [];
+  const data = rows.slice(1, 5000);
+  const lead = (r, n) => r.slice(0, n).join("\x00");
+  const counts = [];
+  for (const row of data) {
+    let name = null;
+    for (let n = 1;n <= header.length && name === null; n++) {
+      const c = counts[n] ??= Map.groupBy(data, (r) => lead(r, n));
+      if (c.get(lead(row, n)).length !== 1)
+        continue;
+      if (n > 1 && [...header.slice(0, n), ...row.slice(0, n)].some((v) => /[,=]/.test(v)))
+        break;
+      name = n === 1 ? row[0] : header.slice(0, n).map((h, i) => `${h}=${row[i]}`).join(",");
+    }
+    if (name !== null)
+      row.forEach((cell, i) => {
+        if (i > 0 && /^-?\d/.test(cell))
+          out.push({ key: `${name}/${header[i] ?? i}`, value: cell });
+      });
+  }
+  return out;
+}
 function values(path) {
   const text = readSmall(path, 4 * 1024 * 1024);
   if (text === null)
@@ -95131,29 +95224,12 @@ function values(path) {
     const lines = Map.groupBy(out, (v) => field(v.key));
     return out.filter((v) => lines.get(field(v.key)).length <= 100);
   }
-  if (/\.(csv|tsv)$/i.test(path)) {
-    const rows = table(path, text);
-    const header = rows[0] ?? [];
-    const data = rows.slice(1, 5000);
-    const lead = (r, n) => r.slice(0, n).join("\x00");
-    const counts = [];
-    for (const row of data) {
-      let name = null;
-      for (let n = 1;n <= header.length && name === null; n++) {
-        const c = counts[n] ??= Map.groupBy(data, (r) => lead(r, n));
-        if (c.get(lead(row, n)).length !== 1)
-          continue;
-        if (n > 1 && [...header.slice(0, n), ...row.slice(0, n)].some((v) => /[,=]/.test(v)))
-          break;
-        name = n === 1 ? row[0] : header.slice(0, n).map((h, i) => `${h}=${row[i]}`).join(",");
-      }
-      if (name !== null)
-        row.forEach((cell, i) => {
-          if (i > 0 && /^-?\d/.test(cell))
-            out.push({ key: `${name}/${header[i] ?? i}`, value: cell });
-        });
-    }
-    return out;
+  if (/\.(csv|tsv)$/i.test(path))
+    return tableValues(table(path, text));
+  if (/\.(md|markdown)$/i.test(path)) {
+    const all = markdownTables(text).flatMap(tableValues);
+    const count = Map.groupBy(all, (v) => v.key);
+    return all.filter((v) => count.get(v.key).length === 1);
   }
   if (/\.(txt|log|out|yaml|yml|tex)$/i.test(path)) {
     for (const line of text.split(/\r?\n/).slice(0, 20000)) {
@@ -95864,7 +95940,7 @@ function firstLine(text) {
   return line.length > 120 ? `${line.slice(0, 119)}\u2026` : line;
 }
 var fromItem = (i) => ({ title: i.title, source: "item", item: i.id, goal: i.goal, subagent: null, session: i.session, since: i.since, from: i.from });
-function working(root, items, now) {
+function working(root, items, now, db) {
   const rows = captureRows(root, undefined, lastDays(2, now)).filter((r) => r.session_id).sort((a, b) => a.ts.localeCompare(b.ts));
   const doing = items.filter((i) => i.state === "doing").sort((a, b) => b.since.localeCompare(a.since));
   const out = [];
@@ -95884,9 +95960,11 @@ function working(root, items, now) {
     }
     if (!mine.length) {
       const asked = list.findLast((r) => r.prompt && !INSERTED.test(r.prompt.trimStart()));
+      const goal = asked && db ? db.prepare(`SELECT intent FROM records WHERE run_id = ? AND ts > ? AND intent_source = 'authored' AND result IS NULL
+        ORDER BY ts DESC LIMIT 1`).get(session, asked.ts)?.intent : undefined;
       out.push({
-        title: asked ? firstLine(asked.prompt) : null,
-        source: asked ? "prompt" : null,
+        title: goal ? firstLine(goal) : asked ? firstLine(asked.prompt) : null,
+        source: goal ? "goal" : asked ? "prompt" : null,
         item: null,
         goal: null,
         agent,
@@ -96027,7 +96105,7 @@ function readStatus(repo, index) {
   const read = (db, records) => {
     const items = readItems(records);
     return {
-      now: working(root, items, now),
+      now: working(root, items, now, db),
       done: finished(db, root, items),
       next: upNext(items),
       goals: Object.fromEntries(allGoals(readGoals(db)).map((g) => [g.id, g.from ? `"${g.title}" (from ${g.from})` : g.title]))
@@ -98012,7 +98090,7 @@ function options(root, cwd) {
       name: "Push check",
       what: "Before each push, says what it shares and stops one that holds a secret.",
       here: onOff(on),
-      recommended: "off",
+      recommended: root && !local && recordsTravel(root) !== null ? "on" : "off",
       chosen: on,
       asks: true,
       choices: ON_OFF.map(([value, label]) => ({ value, label, set: anvc(`push-check ${value}`) }))
@@ -98043,6 +98121,18 @@ function options(root, cwd) {
       chosen: on,
       asks: false,
       choices: ON_OFF.map(([value, label]) => ({ value, label, set: anvc(`approve-goals ${value}`) }))
+    });
+  }
+  if (managedBy() === "plugin") {
+    settings.push({
+      key: "updates",
+      name: "Updates",
+      what: "Automatic installs a release once it's been out two days with nothing newer.",
+      here: updateMode(),
+      recommended: "auto",
+      chosen: updateModeChosen(),
+      asks: false,
+      choices: [{ value: "auto", label: "Automatic", set: anvc("updates auto") }, { value: "ask", label: "Ask first", set: anvc("updates ask") }]
     });
   }
   return {
@@ -99195,17 +99285,23 @@ function backfill(repo, opts = {}) {
 var DATA = /\.(json|jsonl|csv|tsv|md|txt|log)$/i;
 var DOCS = /^(README|CHANGELOG|LICENSE|CONTRIBUTING|AGENTS|CLAUDE|CODE_OF_CONDUCT|SECURITY|NOTICE|TRADEMARKS|CLA)(\.|$)/i;
 var MEASURED = /(?<![\d.])\d+\.\d+(?![\d.])|(?<![\d.])\d+(?:\.\d+)?%/g;
-var holdsNumbers = (text) => (text.match(MEASURED)?.length ?? 0) >= 3;
+function holdsNumbers(text, recorded = () => []) {
+  const found = text.match(MEASURED) ?? [];
+  if (found.length < 3)
+    return false;
+  const known = recorded();
+  return found.filter((n) => !known.some((v) => sameNumber(v, n))).length >= 3;
+}
 function isDataPath(path) {
   const folders = path.split(/[\\/]/);
   const name = folders.pop();
   return DATA.test(name) && !MANIFEST.test(name) && !DOCS.test(name) && !folders.some(skipDir);
 }
-function fileHoldsNumbers(repo, path) {
+function fileHoldsNumbers(repo, path, recorded) {
   if (!isDataPath(path))
     return false;
   const text = readHead(join22(repo, path), 64 * 1024);
-  return text !== null && holdsNumbers(text);
+  return text !== null && holdsNumbers(text, recorded);
 }
 function dataFiles2(repo, limit) {
   const listed = (gitOrNull(repo, ["ls-files", "-z", "--cached", "--others", "--exclude-standard"]) ?? "").split("\x00").filter(isDataPath);
@@ -99241,7 +99337,7 @@ function noteWritten(session, paths) {
 `);
   } catch {}
 }
-function writtenData(repo, session, said) {
+function writtenData(repo, session, said, recorded) {
   let paths = [];
   try {
     paths = readFileSync18(writtenFile(session), "utf8").split(`
@@ -99259,7 +99355,7 @@ function writtenData(repo, session, said) {
       continue;
     }
     for (const p of inside)
-      if (!said(p) && fileHoldsNumbers(repo, p))
+      if (!said(p) && fileHoldsNumbers(repo, p, recorded))
         out.add(p);
   }
   return [...out];

@@ -43,7 +43,7 @@ dependencies = [
 
 [[package]]
 name = "anvc-desktop"
-version = "0.4.10"
+version = "0.4.11"
 dependencies = [
  "getrandom 0.3.4",
  "serde_json",

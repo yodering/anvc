@@ -25,13 +25,14 @@ import { captureFiles, repoKey, stateRoot, uiToken } from "./rawlog";
 import { openDesktop, openWorkLog, PORTS } from "./open";
 import { desktopCommand, installDesktop } from "./desktop";
 import { searchRaw, searchRecords } from "./search";
+import { exportDays } from "./export";
 import { installPrePush, prePush, prePushOn, removePrePush, scanRecords } from "./prepush";
 import { addInstructions, INSTRUCTION_LINES, instructionsFile, instructionsOn, removeInstructions } from "./instructions";
 import { brief, briefText } from "./brief";
 import { splitLine, whyLine } from "./blame";
 import { checkPrivateRemote, privateRemote, sync } from "./sync";
 import { catchUp, earlierSessions } from "./catchup";
-import { anvcCommand, checkForUpdate, codexDir, cursorDir, installLauncher, launcherOnPath, update, updateLine } from "./version";
+import { anvcCommand, autoUpdate, checkForUpdate, codexDir, managedBy, setUpdateMode, updateMode, cursorDir, installLauncher, launcherOnPath, update, updateLine } from "./version";
 import { allActivity, plural, readActivity, repoRoot } from "./activity";
 import { folders, setFolder } from "./folders";
 import { isLocalOnly, LOCAL_ONLY_REFUSAL, setLocalOnly } from "./localonly";
@@ -415,6 +416,10 @@ switch (command) {
     console.log(added
       ? `configured ${remote}: ${added} refspec(s) added; records now travel with git push and git fetch`
       : `${remote} already carries records; nothing to do`);
+    // Turning this on was silent about what it sends, and the next push sent
+    // every shared record made before it: 89 in one project.
+    const waiting = waitingShared(repo).length;
+    if (waiting) console.log(`Your next git push to ${remote} sends ${waiting} shared record${waiting === 1 ? "" : "s"}, with their goals, reasons, commands and file paths. To see them, or keep some here: ${anvcCommand()} review`);
     break;
   }
   case "desktop": {
@@ -544,7 +549,7 @@ switch (command) {
    */
   case "search": {
     const query = positional.join(" ");
-    if (!query.trim()) { console.error("usage: anvc search <words or an error message>"); process.exitCode = 2; break; }
+    if (!query.trim()) { console.error("usage: anvc search <words, an error message or a date such as 2026-10-07>"); process.exitCode = 2; break; }
     const records = withIndex((db) => searchRecords(db, query, 10));
     const raw = searchRaw(repoRoot(repo) ?? repo, query, 8);
     const kept = sourcesSection(repoRoot(repo) ?? repo, query);
@@ -846,9 +851,42 @@ switch (command) {
    * was set up, and the Claude Code plugin is updated through Claude Code.
    * --check only asks whether a clone has one ready.
    */
+  /**
+   * Records as dated Markdown pages: printed, or written one file a day into
+   * --out. Private records only with --private.
+   */
+  case "export": {
+    const root = repoRoot(repo) ?? repo;
+    const dates = positional.filter((p) => /^\d{4}-\d{2}(-\d{2})?$/.test(p));
+    if (dates.length !== positional.length) { console.error("usage: anvc export [2026-10-07 | 2026-10 ...] [--out FOLDER] [--private]"); process.exitCode = 2; break; }
+    const { days, leftOut } = exportDays(root, { dates, private: has("private") });
+    const skipped = leftOut ? `${leftOut} private record${leftOut === 1 ? " was" : "s were"} left out. Add --private to include ${leftOut === 1 ? "it" : "them"}.` : null;
+    if (!days.length) { console.log(["Nothing recorded then.", skipped].filter(Boolean).join(" ")); break; }
+    const out = flag("out", "");
+    if (!out) console.log(days.map((d) => d.page).join("\n"));
+    else {
+      mkdirSync(resolve(out), { recursive: true });
+      for (const d of days) writeFileSync(join(resolve(out), `${d.day}.md`), d.page);
+      console.log(`Wrote ${days.length} page${days.length === 1 ? "" : "s"} to ${out}: ${days.map((d) => `${d.day}.md`).join(", ")}`);
+    }
+    if (skipped) console.error(skipped);
+    break;
+  }
+  case "updates": {
+    const mode = argv[1];
+    if (mode !== undefined && mode !== "auto" && mode !== "ask") { console.error("usage: anvc updates [auto|ask]"); process.exitCode = 2; break; }
+    if (mode === undefined) {
+      console.log(`Updates: ${updateMode() === "auto" ? "automatic, two days after a release comes out unless a newer one follows" : "ANVC asks first"}. To change it: anvc updates auto|ask`
+        + (managedBy() === "plugin" ? "" : `\nThis copy of ANVC is a ${managedBy() === "git" ? "git clone" : "desktop app"}, which doesn't update itself. The setting is for the Claude Code plugin.`));
+      break;
+    }
+    setUpdateMode(mode);
+    console.log(mode === "auto" ? "ANVC installs a release by itself once it's been out two days with nothing newer." : "ANVC asks before it installs a release.");
+    break;
+  }
   case "update": {
     if (has("check")) {
-      const s = checkForUpdate();
+      const s = autoUpdate(checkForUpdate());
       console.log(s.error ? `Couldn't check: ${s.error}.` : s.behind ? `${s.behind} update${s.behind === 1 ? "" : "s"} ready:\n${s.changes.map((c) => `  ${c}`).join("\n")}` : updateLine(s) ?? "anvc is up to date.");
       break;
     }
@@ -962,6 +1000,8 @@ ${launcherOnPath() ? "" : `\n  anvc isn't on your PATH, so run these as: ${anvcC
   anvc forget <id> [...]                   delete private records for good
   anvc unshare <id> [...] | --captured     make records private
   anvc update [--check]                    bring this copy of anvc and its hooks up to date
+  anvc export [DATE ...] [--out FOLDER]     records as Markdown, one page a day; --private adds private ones
+  anvc updates [auto|ask]                  install releases by themselves two days after they come out, or ask first
   anvc sync [--remote NAME]                private history to and from your own remote
   anvc catch-up                            bring in what happened here before anvc was on
   anvc backfill [--write]                  import Claude Code, Codex and Cursor history as private records

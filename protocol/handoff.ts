@@ -16,6 +16,7 @@ import { AGENT_NAMES } from "./agents";
 import { gitOrNull } from "./git";
 import { captureRows, lastDays, samePath } from "./rawlog";
 import { errorLine } from "./search";
+import { onlyLooks } from "./runs";
 import { editedFiles } from "./evidence";
 import type { CaptureEvent } from "./ingest";
 
@@ -47,7 +48,7 @@ export function handoff(root: string, current: string, opts: { db?: Database; ca
   const agent = AGENT_NAMES[last.agent ?? "claude-code"] ?? last.agent ?? "An agent";
 
   const edited = editedFiles(mine, root);
-  const failed = mine.filter((r) => r.tool === "Bash" && r.ok === false).at(-1);
+  const failed = mine.filter((r) => r.tool === "Bash" && r.ok === false && !onlyLooks(r.command ?? "")).at(-1);
   const record = opts.db?.prepare(`SELECT intent, status FROM records WHERE run_id = ? AND TRIM(intent) != '' AND result IS NULL ORDER BY ts DESC LIMIT 1`)
     .get(session) as { intent: string; status: string } | null | undefined;
 

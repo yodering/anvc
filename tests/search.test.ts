@@ -49,6 +49,19 @@ test("the raw log is searched too, with repeats of one error collapsed", async (
   expect(hits[0]!.line).toContain("ETIMEDOUT");
 });
 
+test("a date in the query keeps what was recorded that day, and a date alone lists it", () => {
+  const { dir } = repo();
+  appendRecord(dir, record({ ts: "2026-10-07T12:00:00.000Z" }), { tier: "private" });
+  appendRecord(dir, record({ ts: "2026-10-09T12:00:00.000Z", intent: { goal: "Cache the redis lookups" } }), { tier: "private" });
+  const db = openIndex();
+  buildIndex(db, dir);
+  expect(searchRecords(db, "2026-10-07").map((h) => h.intent)).toEqual(["Pool the redis connections"]);
+  expect(searchRecords(db, "redis 2026-10-09").map((h) => h.intent)).toEqual(["Cache the redis lookups"]);
+  expect(searchRecords(db, "2026-10")).toHaveLength(2);
+  expect(searchRecords(db, "2026-10-08")).toHaveLength(0);
+  db.close();
+});
+
 test("the error line is the error, not the test runner's summary", async () => {
   const { errorLine } = await import("../protocol/search");
   const out = "bun test v1.4\n\ntests/math.test.ts:\nerror: expect(received).toBe(expected)\n\nExpected: 3\nReceived: 6\n\n 0 pass\n 1 fail\nRan 1 test across 1 file.";

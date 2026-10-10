@@ -4,7 +4,7 @@
 // protocol/cli.ts
 import { existsSync as existsSync19, mkdirSync as mkdirSync17, readFileSync as readFileSync22, writeFileSync as writeFileSync15 } from "fs";
 import { homedir as homedir10 } from "os";
-import { basename as basename11, dirname as dirname12, join as join25, resolve as resolve13 } from "path";
+import { basename as basename12, dirname as dirname12, join as join25, resolve as resolve13 } from "path";
 
 // protocol/backfill.ts
 import { existsSync as existsSync7, readdirSync as readdirSync3, readFileSync as readFileSync7, statSync as statSync4 } from "fs";
@@ -460,7 +460,7 @@ import { join as join5 } from "path";
 // package.json
 var package_default = {
   name: "anvc",
-  version: "0.4.10",
+  version: "0.4.11",
   private: true,
   type: "module",
   scripts: {
@@ -775,7 +775,9 @@ function checkForUpdate(home = HOME) {
       windowsHide: true
     });
     const latest = tags.success ? newestTag(tags.stdout.toString()) : null;
-    return save(latest ? { checked, behind: 0, changes: [], latest } : { checked, behind: 0, changes: [], error: "couldn't reach the anvc repository" });
+    const before = readJson(updateFile(), null);
+    const since = before?.latest === latest && before?.since ? before.since : checked;
+    return save(latest ? { ...before, checked, behind: 0, changes: [], latest, since, error: undefined } : { ...before, checked, behind: 0, changes: [], error: "couldn't reach the anvc repository" });
   }
   const upstream = gitOrNull(home, ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"]);
   if (!upstream)
@@ -810,9 +812,33 @@ function checkDaily() {
     spawn("bun", [CLI, "update", "--check"], { detached: true, stdio: "ignore", windowsHide: true }).on("error", () => {}).unref();
   } catch {}
 }
+var modeFile = () => join4(stateHome(), "updates.json");
+var updateMode = () => readJson(modeFile(), {}).mode === "ask" ? "ask" : "auto";
+var updateModeChosen = () => existsSync2(modeFile());
+var setUpdateMode = (mode) => writeJson(modeFile(), { mode });
+var SETTLE_MS = 2 * 86400000;
+function settlesAt(state, current) {
+  if (!state?.latest || !state.since || Bun.semver.order(state.latest, current) <= 0)
+    return null;
+  return Date.parse(state.since) + SETTLE_MS;
+}
+function autoUpdate(state, now = Date.now()) {
+  const at = settlesAt(state, version());
+  if (managedBy() !== "plugin" || updateMode() !== "auto" || at === null || now < at)
+    return state;
+  const done = updatePlugin();
+  if (!done)
+    return state;
+  const ts = new Date(now).toISOString();
+  return save({ ...state, installed: "error" in done ? { error: done.error, ts } : { from: done.from, to: done.to, ts } });
+}
 function updateLine(state) {
   if (state?.latest && Bun.semver.order(state.latest, version()) > 0) {
-    return `ANVC ${state.latest} is out, and this is ${version()}. To update, run in a terminal: claude plugin marketplace update anvc && claude plugin update anvc@anvc, then start a new session.`;
+    if (state.installed?.to === state.latest)
+      return `ANVC ${state.latest} is installed. A new session runs it.`;
+    const at = updateMode() === "auto" ? settlesAt(state, version()) : null;
+    const when = at !== null && at > Date.now() ? ` It installs itself on ${new Date(at).toLocaleDateString("en-GB", { day: "numeric", month: "short" })}, two days after it came out, unless a newer one follows.` : "";
+    return `ANVC ${state.latest} is out, and this is ${version()}.${when} To update now, run in a terminal: claude plugin marketplace update anvc && claude plugin update anvc@anvc, then start a new session.`;
   }
   if (!state || !state.behind)
     return null;
@@ -827,14 +853,16 @@ function updateOffer(state) {
   if (readJson(file, {}).offered === latest)
     return null;
   const desktop = readJson(desktopFile(), {}).version;
+  const auto = managedBy() === "plugin" && updateMode() === "auto";
   const steps = [
-    Bun.semver.order(latest, version()) > 0 ? "`claude plugin marketplace update anvc && claude plugin update anvc@anvc`, after which they start a new session" : null,
+    !auto && Bun.semver.order(latest, version()) > 0 ? "`claude plugin marketplace update anvc && claude plugin update anvc@anvc`, after which they start a new session" : null,
     desktop && Bun.semver.order(latest, desktop) > 0 ? `\`${anvcCommand()} desktop install\` for the desktop app, which is ${desktop}` : null
   ].filter(Boolean);
-  if (!steps.length)
+  const moved = auto && state?.installed?.to === latest && version() === latest ? `ANVC updated itself from ${state.installed.from} to ${latest}. Tell the person in one line.` : null;
+  if (!steps.length && !moved)
     return null;
   return {
-    text: `anvc: ANVC ${latest} is out. Ask the person whether to update, and if they say yes, run ${steps.join(", and ")}.`,
+    text: `anvc: ${[moved, steps.length ? `ANVC ${latest} is out. Ask the person whether to update, and if they say yes, run ${steps.join(", and ")}.` : null].filter(Boolean).join(" ")}`,
     said: () => {
       try {
         writeJson(file, { offered: latest });
@@ -3626,14 +3654,26 @@ function signature(text) {
 function terms(query) {
   return [...new Set(signature(query).split(" ").map((t) => t.replace(/^[^\w/.-]+|[^\w/.-]+$/g, "")).filter((t) => t.length > 1))];
 }
+var DATE = /\b\d{4}-\d{2}(?:-\d{2})?\b/g;
+function datesIn(query) {
+  return { rest: query.replace(DATE, " "), dates: query.match(DATE) ?? [] };
+}
+function localDay(ts) {
+  const d = new Date(ts);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+}
+function onDates(ts, dates) {
+  return !dates.length || dates.some((date) => localDay(ts).startsWith(date));
+}
 function searchRecords(db, query, limit = 10) {
-  const words = terms(query);
+  const { rest, dates } = datesIn(query);
+  const words = terms(rest);
   const match = ftsQuery(words.join(" "));
-  if (!match)
+  if (!match && !dates.length)
     return [];
-  const rows = db.prepare(`SELECT s.id AS id, s.prompt AS prompt, s.errors AS errors, s.detail AS detail, s.files AS files,
-      bm25(search, 0, 10, 6, 2, 4) AS rank
-    FROM search s WHERE search MATCH ? ORDER BY rank LIMIT ?`).all(match, limit);
+  const rows = match ? db.prepare(`SELECT s.id AS id, s.prompt AS prompt, s.errors AS errors, s.detail AS detail, s.files AS files,
+        bm25(search, 0, 10, 6, 2, 4) AS rank
+      FROM search s WHERE search MATCH ? ORDER BY rank LIMIT ?`).all(match, dates.length ? 2000 : limit) : db.prepare(`SELECT id, ts FROM records ORDER BY ts DESC`).all().filter((r) => onDates(r.ts, dates)).slice(0, limit);
   if (!rows.length)
     return [];
   const byId = new Map(hitsById(db, rows.map((r) => r.id)).map((h) => [h.id, h]));
@@ -3654,16 +3694,17 @@ function searchRecords(db, query, limit = 10) {
       matched.push("file");
     if (has(r.detail))
       matched.push("output");
-    return [{ ...hit, matched }];
-  });
+    return onDates(hit.ts, dates) ? [{ ...hit, matched }] : [];
+  }).slice(0, limit);
 }
 function searchRaw(root, query, limit = 10, captureDir) {
-  const words = terms(query);
-  if (!words.length)
+  const { rest, dates } = datesIn(query);
+  const words = terms(rest);
+  if (!words.length && !dates.length)
     return [];
   const found = new Map;
   for (const row of captureRows(root, captureDir)) {
-    if (!row.command && !row.output)
+    if (!row.command && !row.output || !onDates(row.ts, dates))
       continue;
     const whole = signature(`${row.command ?? ""}
 ${row.output ?? ""}`);
@@ -3718,6 +3759,78 @@ function errorLine(output) {
   const noise = /^(ran \d+ tests?|\d+ (pass|fail)|\d+ expect\(\) calls|exit code \d+$)/i;
   const errors = lines.filter((l) => shaped.test(l) && !noise.test(l)).slice(-3);
   return (errors.length ? errors.join(" ") : lines.at(-1) ?? "").slice(0, 300);
+}
+
+// protocol/export.ts
+import { basename as basename4 } from "path";
+var time = (ts) => new Date(ts).toTimeString().slice(0, 5);
+var oneLine = (text) => text.replace(/\s+/g, " ").trim();
+var list = (items, most = 8) => items.slice(0, most).join(", ") + (items.length > most ? ` and ${items.length - most} more` : "");
+function section(r, tier) {
+  if (r.status_item || r.rule || r.tool_note || r.map)
+    return null;
+  const lines = [];
+  if (r.result) {
+    if (r.result.of)
+      lines.push(`## ${time(r.ts)} Result ${r.result.name} marked ${r.result.status}`);
+    else {
+      lines.push(`## ${time(r.ts)} Result: ${r.result.name} = ${r.result.value ?? ""}`);
+      if (r.result.source)
+        lines.push(`From \`${r.result.source.path}\`${r.result.source.key ? `, at ${r.result.source.key}` : ""}.`);
+      if (r.result.command)
+        lines.push(`Made by \`${oneLine(r.result.command)}\`.`);
+    }
+  } else if (r.objective) {
+    lines.push(`## ${time(r.ts)} Goal: ${r.objective.title} (${r.objective.status})`);
+  } else if (r.retires) {
+    lines.push(`## ${time(r.ts)} Retired ${r.retires.id}: ${r.retires.reason}`, oneLine(r.retires.evidence));
+  } else {
+    const title = r.intent.goal ?? (r.intent.prompt ? `(captured) ${oneLine(r.intent.prompt).slice(0, 120)}` : "(no goal)");
+    lines.push(`## ${time(r.ts)} ${r.outcome.status === "abandoned" ? "\u2717 Abandoned" : "\u2713 Kept"}: ${oneLine(title)}`);
+    const tests = r.outcome.tests;
+    const files = r.delta?.files ?? [];
+    for (const [label, value] of [
+      ["Why", r.intent.why && oneLine(r.intent.why)],
+      ["What happened", r.detail?.narrative && oneLine(r.detail.narrative)],
+      ["Files", files.length ? list(files.map((f) => `\`${f}\``)) : null],
+      ["Tests", tests ? `${tests.passed} passed, ${tests.failed} failed` : null],
+      ["Evidence", r.evidence?.length ? list(r.evidence.map((e) => `${e.path ? `\`${e.path}${e.line ? `:${e.line}` : ""}\`` : e.commit ? `commit ${e.commit.slice(0, 12)}` : ""}${e.note ? ` (${oneLine(e.note)})` : ""}`.trim()), 5) : null],
+      ["Ruled out", r.detail?.ruled_out?.length ? r.detail.ruled_out.map((x) => `${oneLine(x.approach)}, because ${oneLine(x.because)}`).join("; ") : null],
+      ["Not checked", r.detail?.not_investigated?.length ? r.detail.not_investigated.map(oneLine).join("; ") : null],
+      ["To check it's still true", r.outcome.recheck ? `\`${r.outcome.recheck}\`` : null]
+    ])
+      if (value)
+        lines.push(`- ${label}: ${value}`);
+  }
+  if (!r.objective)
+    lines.push(`
+<sub>${r.session.agent}, session ${r.session.run_id.slice(0, 8)}, ${tier}, id ${r.id}</sub>`);
+  return lines.join(`
+`);
+}
+function exportDays(repo, opts = {}) {
+  let leftOut = 0;
+  const kept = readRecords(repo).filter(([, r]) => onDates(r.ts, opts.dates ?? [])).filter(([ref]) => {
+    if (opts.private || tierOf(ref) !== "private")
+      return true;
+    leftOut++;
+    return false;
+  }).flatMap(([ref, r]) => {
+    const text = section(r, tierOf(ref));
+    return text ? [{ r, text }] : [];
+  }).sort((a, b) => a.r.ts.localeCompare(b.r.ts));
+  const days = [...Map.groupBy(kept, ({ r }) => localDay(r.ts))].map(([day, items]) => {
+    const attempts = items.filter(({ r }) => !r.result && !r.objective && !r.retires);
+    const abandoned = attempts.filter(({ r }) => r.outcome.status === "abandoned").length;
+    const head = `# ${basename4(repo)}, ${day}
+
+${attempts.length} attempt${attempts.length === 1 ? "" : "s"} recorded, ${abandoned} abandoned. Written by anvc export from the records in git; each was true when it was written.`;
+    return { day, page: `${[head, ...items.map((i) => i.text)].join(`
+
+`)}
+` };
+  });
+  return { days, leftOut };
 }
 
 // protocol/prepush.ts
@@ -4126,7 +4239,7 @@ ${lines.join(`
 
 // protocol/instructions.ts
 import { existsSync as existsSync11, readFileSync as readFileSync12, writeFileSync as writeFileSync9 } from "fs";
-import { basename as basename4, resolve as resolve4 } from "path";
+import { basename as basename5, resolve as resolve4 } from "path";
 var INSTRUCTION_LINES = [
   "Before starting a task, call anvc_dead_ends to see what was already abandoned here.",
   "After finishing or abandoning an attempt, record it with anvc_checkpoint."
@@ -4148,13 +4261,13 @@ function addInstructions(repo, lines = INSTRUCTION_LINES) {
     return null;
   const body = read2(file);
   if (body.includes("anvc_checkpoint"))
-    return { file: basename4(file), added: false };
+    return { file: basename5(file), added: false };
   writeFileSync9(file, `${body.replace(/\s*$/, "")}
 
 ${lines.join(`
 `)}
 `);
-  return { file: basename4(file), added: true };
+  return { file: basename5(file), added: true };
 }
 function removeInstructions(repo) {
   const file = instructionsIn(repo);
@@ -4167,7 +4280,7 @@ function removeInstructions(repo) {
 
 `).replace(/\s*$/, "")}
 `);
-  return basename4(file);
+  return basename5(file);
 }
 
 // protocol/brief.ts
@@ -4265,11 +4378,11 @@ function flags(command) {
   }
   return out;
 }
-var READERS = new Set(["cat", "bat", "head", "tail", "less", "more", "grep", "egrep", "fgrep", "rg", "ag", "ack", "ls", "tree", "find", "fd", "wc", "sed", "echo", "printf", "sort", "uniq", "cut", "tr", "column", "diff", "cmp", "jq", "yq", "file", "stat", "du", "df", "git", "gh", "curl", "wget"]);
+var READERS = new Set(["cat", "bat", "head", "tail", "less", "more", "grep", "egrep", "fgrep", "rg", "ugrep", "ug", "ag", "ack", "ls", "tree", "find", "fd", "wc", "sed", "echo", "printf", "sort", "uniq", "cut", "tr", "column", "diff", "cmp", "jq", "yq", "file", "stat", "du", "df", "git", "gh", "curl", "wget"]);
 var KEYWORDS = new Set(["until", "while", "do", "then", "else", "elif", "if", "!", "{", "("]);
 var QUIET = new Set(["cd", "pushd", "popd", "sleep", "done", "fi", "for", "[", "[[", "test", "true", "false", "export", "set", "mkdir", "rm", "cp", "mv", "touch", "pgrep", "pkill", "kill", "wait", "exit", "}", ")"]);
 var PREFIXES = new Set(["sudo", "time", "env", "nice", "command", "exec", "xargs"]);
-function onlyReads(command) {
+function onlyReads(command, readers = READERS) {
   let read = false;
   for (const line of command.split(`
 `)) {
@@ -4285,13 +4398,15 @@ function onlyReads(command) {
       const program = w.split("/").at(-1);
       if (QUIET.has(program))
         continue;
-      if (!READERS.has(program))
+      if (!readers.has(program))
         return false;
       read = true;
     }
   }
   return read;
 }
+var LOOKUPS = new Set(["cat", "bat", "head", "tail", "less", "grep", "egrep", "fgrep", "rg", "ugrep", "ug", "ag", "ack", "ls", "tree", "find", "fd", "wc", "stat", "file", "which", "type", "du", "jq", "yq", "sort", "uniq", "cut", "column"]);
+var onlyLooks = (command) => onlyReads(command, LOOKUPS);
 function mainStep(command) {
   const steps = command.split(/\s*(?:&&|\|\||;|\||\n)\s*/).map((s) => s.trim()).filter(Boolean);
   for (const step of steps) {
@@ -4494,7 +4609,7 @@ function setDataMode(repo, mode) {
 var FULL_HASH_BYTES = 64 * 1024 * 1024;
 var SAMPLE_BYTES = 1024 * 1024;
 var MAX_FOLDER_FILES = 5000;
-function fingerprint(path) {
+function fingerprint(path, every = false) {
   let stat;
   try {
     stat = statSync6(path);
@@ -4502,7 +4617,7 @@ function fingerprint(path) {
     return null;
   }
   if (stat.isDirectory())
-    return folderPrint(path);
+    return folderPrint(path, every);
   const cache = prints();
   const known = cache.get(path);
   if (known && known.bytes === stat.size && known.mtime === stat.mtimeMs)
@@ -4550,9 +4665,8 @@ function savePrints() {
     writeFileSync10(printsFile(), JSON.stringify(Object.fromEntries(entries)));
   } catch {}
 }
-function folderPrint(root) {
-  const h = createHash4("sha256");
-  let bytes = 0, files = 0;
+function folderFiles(root, every = false) {
+  const files = [];
   const base = samePath(root);
   const walk = (dir) => {
     let names = [];
@@ -4562,7 +4676,7 @@ function folderPrint(root) {
       return;
     }
     for (const name of names) {
-      if (files >= MAX_FOLDER_FILES || name === ".git" || name === "node_modules")
+      if (files.length >= MAX_FOLDER_FILES || name === ".git" || name === "node_modules")
         continue;
       const path = join16(dir, name);
       let stat;
@@ -4578,18 +4692,31 @@ function folderPrint(root) {
         continue;
       }
       if (stat.isDirectory()) {
-        walk(path);
+        if (every || !skipDir(name))
+          walk(path);
         continue;
       }
-      files++;
-      bytes += stat.size;
-      h.update(`${below(root, path)}\x00${stat.size}\x00`);
-      if (stat.size <= 256 * 1024)
-        h.update(readFileSync13(path));
+      if (!every && /\.py[co]$|^\.DS_Store$/.test(name))
+        continue;
+      files.push({ path, size: stat.size, mtime: stat.mtimeMs });
     }
   };
   walk(root);
-  return { hash: `${files >= MAX_FOLDER_FILES ? "folder-partial" : "folder"}:${h.digest("hex")}`, bytes };
+  return { files, partial: files.length >= MAX_FOLDER_FILES };
+}
+function folderPrint(root, every = false) {
+  const h = createHash4("sha256");
+  const { files, partial } = folderFiles(root, every);
+  for (const f of files) {
+    h.update(`${below(root, f.path)}\x00${f.size}\x00`);
+    if (f.size <= 256 * 1024)
+      h.update(readFileSync13(f.path));
+  }
+  const name = every ? "folder" : "files";
+  return { hash: `${partial ? `${name}-partial` : name}:${h.digest("hex")}`, bytes: files.reduce((n, f) => n + f.size, 0) };
+}
+function newerIn(root, since) {
+  return folderFiles(root).files.filter((f) => f.mtime > since).sort((a, b) => b.mtime - a.mtime).slice(0, 3).map((f) => below(root, f.path));
 }
 function parseJson(text) {
   try {
@@ -4648,6 +4775,31 @@ function rowsNamed(rows, name) {
     return rows.slice(1).filter((r) => r[0] === name);
   return rows.slice(1).filter((r) => pairs.every(([col, v]) => r[col] === v));
 }
+function cellAt(rows, key) {
+  for (let at = key.indexOf("/");at >= 0; at = key.indexOf("/", at + 1)) {
+    const col = rows[0]?.indexOf(key.slice(at + 1)) ?? -1;
+    const hits = col >= 0 ? rowsNamed(rows, key.slice(0, at)) : [];
+    if (hits.length === 1 && hits[0][col] !== undefined)
+      return hits[0][col];
+  }
+  return null;
+}
+function markdownTables(text) {
+  const tables = [];
+  let rows = [];
+  for (const line of [...text.split(/\r?\n/), ""]) {
+    if (!/^\s*\|.*\|\s*$/.test(line)) {
+      if (rows.length > 1)
+        tables.push(rows);
+      rows = [];
+      continue;
+    }
+    const cells = line.trim().slice(1, -1).split("|").map((c) => c.trim().replace(/^[*_`]+|[*_`]+$/g, ""));
+    if (!cells.every((c) => /^:?-+:?$/.test(c)))
+      rows.push(cells);
+  }
+  return tables;
+}
 function readValue(path, key) {
   const text = readSmall(path, 16 * 1024 * 1024);
   if (text === null)
@@ -4665,15 +4817,12 @@ function readValue(path, key) {
       return null;
     }
   }
-  if (/\.(csv|tsv)$/i.test(path) && key.includes("/")) {
-    const rows = table(path, text);
-    for (let at = key.indexOf("/");at >= 0; at = key.indexOf("/", at + 1)) {
-      const col = rows[0]?.indexOf(key.slice(at + 1)) ?? -1;
-      const hits = col >= 0 ? rowsNamed(rows, key.slice(0, at)) : [];
-      if (hits.length === 1 && hits[0][col] !== undefined)
-        return hits[0][col];
-    }
-    return null;
+  if (/\.(csv|tsv)$/i.test(path) && key.includes("/"))
+    return cellAt(table(path, text), key);
+  if (/\.(md|markdown)$/i.test(path) && key.includes("/")) {
+    const hits = markdownTables(text).map((rows) => cellAt(rows, key)).filter((v) => v !== null);
+    if (hits.length)
+      return hits.length === 1 ? hits[0] : null;
   }
   const line = text.split(/\r?\n/).find((l) => l.includes(key));
   const after = line ? line.slice(line.indexOf(key) + key.length) : "";
@@ -4901,20 +5050,25 @@ function listResults(repo) {
   }
   return [...roots.values()].sort((a, b) => b.ts.localeCompare(a.ts));
 }
-var fingerprintInside = (repo, path) => {
+var fingerprintInside = (repo, path, every = false) => {
   const real = realInside(repo, path);
-  return real ? fingerprint(real) : null;
+  return real ? fingerprint(real, every) : null;
 };
 var stateOf = (repo, path, hash) => {
   if (!hash)
     return "unknown";
-  const now = fingerprintInside(repo, path);
+  const now = fingerprintInside(repo, path, hash.startsWith("folder"));
   return !now ? "missing" : now.hash === hash ? "same" : "changed";
 };
 function checkResult(repo, view, all) {
   const real = view.source && realInside(repo, view.source.path);
   const source = view.source ? { state: stateOf(repo, view.source.path, view.source.hash), now: view.source.key && real ? readValue(real, view.source.key) : null } : null;
-  const depends = view.depends.map((d) => ({ path: d.path, state: stateOf(repo, d.path, d.hash) }));
+  const depends = view.depends.map((d) => {
+    const state = stateOf(repo, d.path, d.hash);
+    const real = state === "changed" && realInside(repo, d.path);
+    const newer = real && statSync6(real).isDirectory() ? newerIn(real, Date.parse(view.ts)) : [];
+    return { path: d.path, state, ...newer.length ? { newer } : {} };
+  });
   const everyone = all ?? listResults(repo);
   const derived = view.derived_from.map((id) => {
     const from = everyone.find((r) => r.id === id);
@@ -4941,7 +5095,7 @@ function describe(view, check, all = []) {
   if (view.command)
     lines.push(`  made by: ${view.command}${Object.keys(view.settings).length ? ` \xB7 ${Object.entries(view.settings).map(([k, v]) => `${k}=${v}`).join(", ")}` : ""}`);
   if (check.depends.length) {
-    lines.push(`  depends on: ${check.depends.map((d) => `${d.path} ${d.state === "same" ? "unchanged" : d.state === "changed" ? "CHANGED" : d.state === "missing" ? "missing" : "?"}`).join(", ")}`);
+    lines.push(`  depends on: ${check.depends.map((d) => `${d.path} ${d.state === "same" ? "unchanged" : d.state === "changed" ? `CHANGED${d.newer ? ` (newer: ${d.newer.join(", ")})` : ""}` : d.state === "missing" ? "missing" : "?"}`).join(", ")}`);
   }
   if (check.derived.length)
     lines.push(`  computed from: ${check.derived.map((d) => `${d.name} (${d.status})`).join(", ")}`);
@@ -4980,6 +5134,30 @@ function logRows(repo) {
 function producer(repo, path) {
   return logRows(repo).filter((r) => r.outputs?.some((o) => o.path === path)).at(-1) ?? null;
 }
+function tableValues(rows) {
+  const out = [];
+  const header = rows[0] ?? [];
+  const data = rows.slice(1, 5000);
+  const lead = (r, n) => r.slice(0, n).join("\x00");
+  const counts = [];
+  for (const row of data) {
+    let name = null;
+    for (let n = 1;n <= header.length && name === null; n++) {
+      const c = counts[n] ??= Map.groupBy(data, (r) => lead(r, n));
+      if (c.get(lead(row, n)).length !== 1)
+        continue;
+      if (n > 1 && [...header.slice(0, n), ...row.slice(0, n)].some((v) => /[,=]/.test(v)))
+        break;
+      name = n === 1 ? row[0] : header.slice(0, n).map((h, i) => `${h}=${row[i]}`).join(",");
+    }
+    if (name !== null)
+      row.forEach((cell, i) => {
+        if (i > 0 && /^-?\d/.test(cell))
+          out.push({ key: `${name}/${header[i] ?? i}`, value: cell });
+      });
+  }
+  return out;
+}
 function values(path) {
   const text = readSmall(path, 4 * 1024 * 1024);
   if (text === null)
@@ -5011,29 +5189,12 @@ function values(path) {
     const lines = Map.groupBy(out, (v) => field(v.key));
     return out.filter((v) => lines.get(field(v.key)).length <= 100);
   }
-  if (/\.(csv|tsv)$/i.test(path)) {
-    const rows = table(path, text);
-    const header = rows[0] ?? [];
-    const data = rows.slice(1, 5000);
-    const lead = (r, n) => r.slice(0, n).join("\x00");
-    const counts = [];
-    for (const row of data) {
-      let name = null;
-      for (let n = 1;n <= header.length && name === null; n++) {
-        const c = counts[n] ??= Map.groupBy(data, (r) => lead(r, n));
-        if (c.get(lead(row, n)).length !== 1)
-          continue;
-        if (n > 1 && [...header.slice(0, n), ...row.slice(0, n)].some((v) => /[,=]/.test(v)))
-          break;
-        name = n === 1 ? row[0] : header.slice(0, n).map((h, i) => `${h}=${row[i]}`).join(",");
-      }
-      if (name !== null)
-        row.forEach((cell, i) => {
-          if (i > 0 && /^-?\d/.test(cell))
-            out.push({ key: `${name}/${header[i] ?? i}`, value: cell });
-        });
-    }
-    return out;
+  if (/\.(csv|tsv)$/i.test(path))
+    return tableValues(table(path, text));
+  if (/\.(md|markdown)$/i.test(path)) {
+    const all = markdownTables(text).flatMap(tableValues);
+    const count = Map.groupBy(all, (v) => v.key);
+    return all.filter((v) => count.get(v.key).length === 1);
   }
   if (/\.(txt|log|out|yaml|yml|tex)$/i.test(path)) {
     for (const line of text.split(/\r?\n/).slice(0, 20000)) {
@@ -5215,17 +5376,23 @@ function whence(repo, text, limit = 8, scope = {}, context = {}) {
 var DATA = /\.(json|jsonl|csv|tsv|md|txt|log)$/i;
 var DOCS = /^(README|CHANGELOG|LICENSE|CONTRIBUTING|AGENTS|CLAUDE|CODE_OF_CONDUCT|SECURITY|NOTICE|TRADEMARKS|CLA)(\.|$)/i;
 var MEASURED = /(?<![\d.])\d+\.\d+(?![\d.])|(?<![\d.])\d+(?:\.\d+)?%/g;
-var holdsNumbers = (text) => (text.match(MEASURED)?.length ?? 0) >= 3;
+function holdsNumbers(text, recorded = () => []) {
+  const found = text.match(MEASURED) ?? [];
+  if (found.length < 3)
+    return false;
+  const known = recorded();
+  return found.filter((n) => !known.some((v) => sameNumber(v, n))).length >= 3;
+}
 function isDataPath(path) {
   const folders = path.split(/[\\/]/);
   const name = folders.pop();
   return DATA.test(name) && !MANIFEST.test(name) && !DOCS.test(name) && !folders.some(skipDir);
 }
-function fileHoldsNumbers(repo, path) {
+function fileHoldsNumbers(repo, path, recorded) {
   if (!isDataPath(path))
     return false;
   const text = readHead(join17(repo, path), 64 * 1024);
-  return text !== null && holdsNumbers(text);
+  return text !== null && holdsNumbers(text, recorded);
 }
 function dataFiles2(repo, limit) {
   const listed = (gitOrNull(repo, ["ls-files", "-z", "--cached", "--others", "--exclude-standard"]) ?? "").split("\x00").filter(isDataPath);
@@ -5261,7 +5428,7 @@ function noteWritten(session, paths) {
 `);
   } catch {}
 }
-function writtenData(repo, session, said) {
+function writtenData(repo, session, said, recorded) {
   let paths = [];
   try {
     paths = readFileSync14(writtenFile(session), "utf8").split(`
@@ -5279,7 +5446,7 @@ function writtenData(repo, session, said) {
       continue;
     }
     for (const p of inside)
-      if (!said(p) && fileHoldsNumbers(repo, p))
+      if (!said(p) && fileHoldsNumbers(repo, p, recorded))
         out.add(p);
   }
   return [...out];
@@ -5323,7 +5490,7 @@ function catchUp(repo) {
 import { spawn as spawn3, spawnSync as spawnSync3 } from "child_process";
 import { existsSync as existsSync14, mkdtempSync as mkdtempSync2, readFileSync as readFileSync16, rmSync as rmSync7, statSync as statSync9, writeFileSync as writeFileSync12 } from "fs";
 import { tmpdir as tmpdir2 } from "os";
-import { basename as basename6, join as join19 } from "path";
+import { basename as basename7, join as join19 } from "path";
 
 // protocol/goals.ts
 import { existsSync as existsSync13, mkdirSync as mkdirSync14, rmSync as rmSync6, writeFileSync as writeFileSync11 } from "fs";
@@ -5532,7 +5699,7 @@ function goalTool(repo, name, args, actor) {
 // protocol/rules.ts
 import { readFileSync as readFileSync15, statSync as statSync8 } from "fs";
 import { homedir as homedir8 } from "os";
-import { basename as basename5, join as join18, resolve as resolve7 } from "path";
+import { basename as basename6, join as join18, resolve as resolve7 } from "path";
 var COMMIT = "commit";
 var shape = (x) => ({ name: x.name, applies: x.applies ?? [], source: x.source ?? null, text: x.text ?? null });
 function listRules(repo) {
@@ -5566,7 +5733,7 @@ function covers(set, target) {
 var where = (set) => set.source ? `${set.source.path}${set.source.heading ? ` \u203A ${set.source.heading}` : ""}` : "kept in ANVC";
 var HEADING = /^ {0,3}(#{1,6})\s+(.*?)(?:\s+#+)?\s*$/;
 var bare = (heading) => heading.replace(/^#+\s*/, "").trim().toLowerCase();
-function section(markdown, heading) {
+function section2(markdown, heading) {
   if (!heading)
     return markdown.trim();
   const want = bare(heading);
@@ -5605,7 +5772,7 @@ function ruleText(repo, set) {
   } catch {
     return { missing: `There's no ${path} in this repository.` };
   }
-  const text = section(body, heading);
+  const text = section2(body, heading);
   return text === null ? { missing: `${path} has no heading "${heading}".` } : { text };
 }
 function ruleFiles(repo) {
@@ -5621,7 +5788,7 @@ function ruleFiles(repo) {
       if (statSync8(file).size > 256 * 1024)
         return [];
       const text = readFileSync15(file, "utf8").trim();
-      return text ? [{ path: scope === "everywhere" ? file.replace(home, "~") : basename5(file), scope, text }] : [];
+      return text ? [{ path: scope === "everywhere" ? file.replace(home, "~") : basename6(file), scope, text }] : [];
     } catch {
       return [];
     }
@@ -6206,7 +6373,7 @@ function absorb(repo, opts = {}) {
     if (!m.prompts.length && !m.attempts.length)
       return null;
     const runner = opts.runner ?? (mode === "codex" ? viaCodex : viaClaude);
-    const answer = runner(SYSTEM, brief2(basename6(repo), goalTree(repo), listRules(repo), m, withIndex(repo, (db) => partMaps(db)), filesSummary(repo)));
+    const answer = runner(SYSTEM, brief2(basename7(repo), goalTree(repo), listRules(repo), m, withIndex(repo, (db) => partMaps(db)), filesSummary(repo)));
     const session = [...m.prompts, ...m.attempts].sort((a, b) => a.ts.localeCompare(b.ts)).at(-1).session || "absorbed";
     const { ids, titles } = applyPlan(repo, parsePlan(answer.text), { kind: "agent", agent: "anvc", session });
     writeJson(cursorFile(repo), { since: m.until, ran, runs: (cursor?.runs ?? 0) + 1, tokens: (cursor?.tokens ?? 0) + answer.tokens });
@@ -6412,14 +6579,14 @@ function checkDocument(repo, path) {
 
 // protocol/uninstall.ts
 import { existsSync as existsSync16, readdirSync as readdirSync8, readFileSync as readFileSync19, rmSync as rmSync8, writeFileSync as writeFileSync13 } from "fs";
-import { basename as basename8, join as join21, resolve as resolve9 } from "path";
+import { basename as basename9, join as join21, resolve as resolve9 } from "path";
 
 // protocol/tools.ts
 import { existsSync as existsSync15, readdirSync as readdirSync7, readFileSync as readFileSync18 } from "fs";
 import { homedir as homedir9 } from "os";
-import { basename as basename7, join as join20, resolve as resolve8 } from "path";
+import { basename as basename8, join as join20, resolve as resolve8 } from "path";
 var obj = (v) => v && typeof v === "object" && !Array.isArray(v) ? v : {};
-var list = (v) => Array.isArray(v) ? v.filter((x) => typeof x === "string") : typeof v === "string" ? [v] : [];
+var list2 = (v) => Array.isArray(v) ? v.filter((x) => typeof x === "string") : typeof v === "string" ? [v] : [];
 var json = (file) => obj(readJson(file, {}));
 var tilde = (text) => {
   const home = homedir9();
@@ -6429,13 +6596,13 @@ var SCRIPT = /\.(?:[cm]?js|ts|sh|bash|py|rb|pl|ps1)$/;
 function howRuns(words) {
   const clean = words.map((w) => w.replace(/["']/g, "")).filter(Boolean);
   const what = clean.slice(1).find((w) => /^@[\w.-]+\/[\w.-]+(@[\w.^~-]+)?$/.test(w) || SCRIPT.test(w) || /^[\w.-]*mcp[\w.-]*(@[\w.^~-]+)?$/i.test(w));
-  return scrub([basename7(clean[0] ?? ""), what && (what.startsWith("@") ? what : basename7(what))].filter(Boolean).join(" "));
+  return scrub([basename8(clean[0] ?? ""), what && (what.startsWith("@") ? what : basename8(what))].filter(Boolean).join(" "));
 }
 function server(entry) {
-  const names = (...values) => [...new Set(values.flatMap((v) => Array.isArray(v) ? list(v) : Object.keys(obj(v))))].sort();
+  const names = (...values) => [...new Set(values.flatMap((v) => Array.isArray(v) ? list2(v) : Object.keys(obj(v))))].sort();
   let runs;
   if (typeof entry.command === "string")
-    runs = howRuns([...entry.command.split(/\s+/), ...list(entry.args)]);
+    runs = howRuns([...entry.command.split(/\s+/), ...list2(entry.args)]);
   else if (typeof entry.url === "string" || typeof entry.serverUrl === "string") {
     try {
       runs = new URL(String(entry.url ?? entry.serverUrl)).origin;
@@ -6443,14 +6610,14 @@ function server(entry) {
       runs = "a URL";
     }
   }
-  const env = names(entry.env, entry.env_vars, list(entry.bearer_token_env_var));
+  const env = names(entry.env, entry.env_vars, list2(entry.bearer_token_env_var));
   const headers = names(entry.headers, entry.http_headers, entry.env_http_headers);
   return { ...runs ? { runs } : {}, ...env.length ? { env } : {}, ...headers.length ? { headers } : {} };
 }
 function hookName(command) {
   const words = command.split(/\s+/).map((w) => w.replace(/["']/g, "")).filter((w) => w && !w.includes("="));
   const script = words.find((w) => SCRIPT.test(w));
-  return scrub(basename7(script ?? words[0] ?? "")) || "hook";
+  return scrub(basename8(script ?? words[0] ?? "")) || "hook";
 }
 var ANVC_SERVER = /protocol\/mcp\.ts/;
 function servers(map, where, file, state, anvc = false) {
@@ -6509,7 +6676,7 @@ function commands(paths, where, state, anvc) {
       return [];
     }
   });
-  return files.map((f) => ({ kind: "command", name: basename7(f, ".md"), where, state, anvc, file: tilde(f) }));
+  return files.map((f) => ({ kind: "command", name: basename8(f, ".md"), where, state, anvc, file: tilde(f) }));
 }
 function claudeConfig() {
   const legacy = join20(claudeDir(), ".config.json");
@@ -6526,12 +6693,12 @@ function claudeCode(repo, root) {
   const thisProject = (path) => matchers.some((here) => here(path));
   const projects = obj(config.data.projects);
   const project = obj(projects[repo ?? ""] ?? projects[root ?? ""] ?? Object.entries(projects).find(([key]) => thisProject(key))?.[1]);
-  const disabled = new Set(list(project.disabledMcpServers));
+  const disabled = new Set(list2(project.disabledMcpServers));
   const hooksOff = last("disableAllHooks") === true;
   const skillOff = merged("skillOverrides");
   const skillState = (...names) => names.some((n) => skillOff[n] === "off") ? "off" : "on";
-  const approved = new Set([...layers.flatMap((l) => list(l.enabledMcpjsonServers)), ...list(project.enabledMcpjsonServers)]);
-  const refused = new Set([...layers.flatMap((l) => list(l.disabledMcpjsonServers)), ...list(project.disabledMcpjsonServers)]);
+  const approved = new Set([...layers.flatMap((l) => list2(l.enabledMcpjsonServers)), ...list2(project.enabledMcpjsonServers)]);
+  const refused = new Set([...layers.flatMap((l) => list2(l.disabledMcpjsonServers)), ...list2(project.disabledMcpjsonServers)]);
   const everyMcpjson = last("enableAllProjectMcpServers") === true;
   const userOn = (name) => disabled.has(name) ? "off" : "on";
   const out = [
@@ -6557,16 +6724,16 @@ function claudeCode(repo, root) {
     const anvc = name === "anvc";
     out.push({ kind: "plugin", name, where: here.some((i) => i.scope === "user") ? "every project" : "this project", state, anvc, file: tilde(join20(path, ".claude-plugin/plugin.json")) });
     const within = (p) => resolve8(path, p);
-    const mcp = typeof manifest.mcpServers === "string" || Array.isArray(manifest.mcpServers) ? list(manifest.mcpServers).map((f) => [within(f), json(within(f))]) : manifest.mcpServers ? [[join20(path, ".claude-plugin/plugin.json"), { mcpServers: manifest.mcpServers }]] : [[join20(path, ".mcp.json"), json(join20(path, ".mcp.json"))]];
+    const mcp = typeof manifest.mcpServers === "string" || Array.isArray(manifest.mcpServers) ? list2(manifest.mcpServers).map((f) => [within(f), json(within(f))]) : manifest.mcpServers ? [[join20(path, ".claude-plugin/plugin.json"), { mcpServers: manifest.mcpServers }]] : [[join20(path, ".mcp.json"), json(join20(path, ".mcp.json"))]];
     for (const [file, data] of mcp)
       out.push(...servers(data.mcpServers ?? data, name, file, (s) => state === "on" && disabled.has(s) ? "off" : state, anvc));
-    const hookFiles = typeof manifest.hooks === "string" || Array.isArray(manifest.hooks) ? list(manifest.hooks).map((f) => [within(f), json(within(f))]) : manifest.hooks ? [[join20(path, ".claude-plugin/plugin.json"), obj(manifest.hooks)]] : [[join20(path, "hooks/hooks.json"), json(join20(path, "hooks/hooks.json"))]];
+    const hookFiles = typeof manifest.hooks === "string" || Array.isArray(manifest.hooks) ? list2(manifest.hooks).map((f) => [within(f), json(within(f))]) : manifest.hooks ? [[join20(path, ".claude-plugin/plugin.json"), obj(manifest.hooks)]] : [[join20(path, "hooks/hooks.json"), json(join20(path, "hooks/hooks.json"))]];
     for (const [file, data] of hookFiles)
       out.push(...hooks(data.hooks ?? data, name, file, () => hooksOff ? "off" : state, anvc));
-    for (const folder of [join20(path, "skills"), ...list(manifest.skills).map(within)]) {
+    for (const folder of [join20(path, "skills"), ...list2(manifest.skills).map(within)]) {
       out.push(...skills(folder, name, (s) => state === "on" ? skillState(`${name}:${s}`, s) : state, anvc));
     }
-    out.push(...commands([join20(path, "commands"), ...list(manifest.commands).map(within)], name, state, anvc));
+    out.push(...commands([join20(path, "commands"), ...list2(manifest.commands).map(within)], name, state, anvc));
   }
   return out;
 }
@@ -6836,7 +7003,7 @@ function uninstall(given, opts = {}) {
   if (instructions && opts.instructions)
     removed.push(`the ANVC lines in ${removeInstructions(repo)} (commit the change)`);
   else if (instructions)
-    kept.push(`the ANVC lines in ${basename8(instructions)}; --instructions removes them`);
+    kept.push(`the ANVC lines in ${basename9(instructions)}; --instructions removes them`);
   const refs = recordRefs(repo);
   if (refs.length && opts.records) {
     deleteRefs(repo, refs);
@@ -6934,7 +7101,7 @@ function withoutCodexServer(text) {
 import { spawnSync as spawnSync4 } from "child_process";
 import { createHash as createHash5 } from "crypto";
 import { chmodSync as chmodSync3, existsSync as existsSync17, mkdirSync as mkdirSync15, readdirSync as readdirSync9, readFileSync as readFileSync20, rmSync as rmSync9, statSync as statSync11, writeFileSync as writeFileSync14 } from "fs";
-import { basename as basename9, dirname as dirname10, join as join22, resolve as resolve10 } from "path";
+import { basename as basename10, dirname as dirname10, join as join22, resolve as resolve10 } from "path";
 var ANVC_REF = /^refs\/(remotes\/[^/]+\/)?anvc(-[a-z]+)?\//;
 var RECORD_REF = /^refs\/(remotes\/[^/]+\/)?anvc(-private)?\//;
 var REMOTE_REF = /^refs\/anvc(-[a-z]+)?\//;
@@ -7012,7 +7179,7 @@ function backup(given, removedFrom = []) {
   mkdirSync15(dir, { recursive: true, mode: 448 });
   chmodSync3(dir, 448);
   const stamp = new Date(meta.created).toLocaleString("sv-SE").replace(" ", "-").replaceAll(":", "");
-  const name = basename9(p.root).replace(/[^A-Za-z0-9._-]/g, "-");
+  const name = basename10(p.root).replace(/[^A-Za-z0-9._-]/g, "-");
   let file = join22(dir, `${name}-${stamp}.bundle`);
   for (let i = 2;existsSync17(file); i++)
     file = join22(dir, `${name}-${stamp}-${i}.bundle`);
@@ -7467,7 +7634,7 @@ function helped(db, repo, rows = allActivity(repo)) {
 
 // protocol/options.ts
 import { existsSync as existsSync18 } from "fs";
-import { basename as basename10 } from "path";
+import { basename as basename11 } from "path";
 var ABOUT = "ANVC keeps what coding agents tried and gave up on, and shows it to the next agent.";
 var setupEverywhere = (agents) => ["--global", "--agent", agents.join(",")];
 var setupProject = (repo, agents) => ["--repo", repo, "--agent", agents.join(","), "--no-remote", "--no-instructions"];
@@ -7639,7 +7806,7 @@ function options(root, cwd) {
       name: "Push check",
       what: "Before each push, says what it shares and stops one that holds a secret.",
       here: onOff(on),
-      recommended: "off",
+      recommended: root && !local && recordsTravel(root) !== null ? "on" : "off",
       chosen: on,
       asks: true,
       choices: ON_OFF.map(([value, label]) => ({ value, label, set: anvc(`push-check ${value}`) }))
@@ -7651,7 +7818,7 @@ function options(root, cwd) {
     settings.push({
       key: "instructions",
       name: "Instructions",
-      what: `Lines in ${basename10(file)} asking your agent to check past dead ends and record its work. The project commits this file.`,
+      what: `Lines in ${basename11(file)} asking your agent to check past dead ends and record its work. The project commits this file.`,
       here: onOff(on),
       recommended: "off",
       chosen: on,
@@ -7670,6 +7837,18 @@ function options(root, cwd) {
       chosen: on,
       asks: false,
       choices: ON_OFF.map(([value, label]) => ({ value, label, set: anvc(`approve-goals ${value}`) }))
+    });
+  }
+  if (managedBy() === "plugin") {
+    settings.push({
+      key: "updates",
+      name: "Updates",
+      what: "Automatic installs a release once it's been out two days with nothing newer.",
+      here: updateMode(),
+      recommended: "auto",
+      chosen: updateModeChosen(),
+      asks: false,
+      choices: [{ value: "auto", label: "Automatic", set: anvc("updates auto") }, { value: "ask", label: "Ask first", set: anvc("updates ask") }]
     });
   }
   return {
@@ -8101,7 +8280,7 @@ function firstLine(text) {
   return line.length > 120 ? `${line.slice(0, 119)}\u2026` : line;
 }
 var fromItem = (i) => ({ title: i.title, source: "item", item: i.id, goal: i.goal, subagent: null, session: i.session, since: i.since, from: i.from });
-function working(root, items, now) {
+function working(root, items, now, db) {
   const rows = captureRows(root, undefined, lastDays(2, now)).filter((r) => r.session_id).sort((a, b) => a.ts.localeCompare(b.ts));
   const doing = items.filter((i) => i.state === "doing").sort((a, b) => b.since.localeCompare(a.since));
   const out = [];
@@ -8121,9 +8300,11 @@ function working(root, items, now) {
     }
     if (!mine.length) {
       const asked = list.findLast((r) => r.prompt && !INSERTED.test(r.prompt.trimStart()));
+      const goal = asked && db ? db.prepare(`SELECT intent FROM records WHERE run_id = ? AND ts > ? AND intent_source = 'authored' AND result IS NULL
+        ORDER BY ts DESC LIMIT 1`).get(session, asked.ts)?.intent : undefined;
       out.push({
-        title: asked ? firstLine(asked.prompt) : null,
-        source: asked ? "prompt" : null,
+        title: goal ? firstLine(goal) : asked ? firstLine(asked.prompt) : null,
+        source: goal ? "goal" : asked ? "prompt" : null,
         item: null,
         goal: null,
         agent,
@@ -8264,7 +8445,7 @@ function readStatus(repo, index) {
   const read = (db, records) => {
     const items = readItems(records);
     return {
-      now: working(root, items, now),
+      now: working(root, items, now, db),
       done: finished(db, root, items),
       next: upNext(items),
       goals: Object.fromEntries(allGoals(readGoals(db)).map((g) => [g.id, g.from ? `"${g.title}" (from ${g.from})` : g.title]))
@@ -8816,7 +8997,7 @@ ${INSTRUCTION_LINES.map((l) => `  ${l}`).join(`
       console.log(file ? `Removed the lines from ${file}. The project commits this file, so commit the change.` : "No ANVC lines in AGENTS.md or CLAUDE.md; nothing to do.");
     } else if (want === undefined) {
       const file = instructionsFile(repo);
-      console.log(file ? `${basename11(file)} ${instructionsOn(repo) ? "asks" : "doesn't ask"} your agent to record its work. Change it: anvc instructions on|off` : "There's no AGENTS.md or CLAUDE.md here.");
+      console.log(file ? `${basename12(file)} ${instructionsOn(repo) ? "asks" : "doesn't ask"} your agent to record its work. Change it: anvc instructions on|off` : "There's no AGENTS.md or CLAUDE.md here.");
     } else {
       console.error("usage: anvc instructions [on|off]");
       process.exitCode = 2;
@@ -8866,6 +9047,9 @@ ${INSTRUCTION_LINES.map((l) => `  ${l}`).join(`
     if (removed)
       console.log(`${remote}: git push now sends the current branch, not every local branch`);
     console.log(added ? `configured ${remote}: ${added} refspec(s) added; records now travel with git push and git fetch` : `${remote} already carries records; nothing to do`);
+    const waiting = waitingShared(repo).length;
+    if (waiting)
+      console.log(`Your next git push to ${remote} sends ${waiting} shared record${waiting === 1 ? "" : "s"}, with their goals, reasons, commands and file paths. To see them, or keep some here: ${anvcCommand()} review`);
     break;
   }
   case "desktop": {
@@ -8998,7 +9182,7 @@ ${result.failed.length} record(s) could not be written:`);
   case "search": {
     const query = positional2.join(" ");
     if (!query.trim()) {
-      console.error("usage: anvc search <words or an error message>");
+      console.error("usage: anvc search <words, an error message or a date such as 2026-10-07>");
       process.exitCode = 2;
       break;
     }
@@ -9356,9 +9540,53 @@ retired (${retired.length})`);
       process.exitCode = 1;
     break;
   }
+  case "export": {
+    const root = repoRoot(repo) ?? repo;
+    const dates = positional2.filter((p) => /^\d{4}-\d{2}(-\d{2})?$/.test(p));
+    if (dates.length !== positional2.length) {
+      console.error("usage: anvc export [2026-10-07 | 2026-10 ...] [--out FOLDER] [--private]");
+      process.exitCode = 2;
+      break;
+    }
+    const { days, leftOut } = exportDays(root, { dates, private: has2("private") });
+    const skipped = leftOut ? `${leftOut} private record${leftOut === 1 ? " was" : "s were"} left out. Add --private to include ${leftOut === 1 ? "it" : "them"}.` : null;
+    if (!days.length) {
+      console.log(["Nothing recorded then.", skipped].filter(Boolean).join(" "));
+      break;
+    }
+    const out = flag2("out", "");
+    if (!out)
+      console.log(days.map((d) => d.page).join(`
+`));
+    else {
+      mkdirSync17(resolve13(out), { recursive: true });
+      for (const d of days)
+        writeFileSync15(join25(resolve13(out), `${d.day}.md`), d.page);
+      console.log(`Wrote ${days.length} page${days.length === 1 ? "" : "s"} to ${out}: ${days.map((d) => `${d.day}.md`).join(", ")}`);
+    }
+    if (skipped)
+      console.error(skipped);
+    break;
+  }
+  case "updates": {
+    const mode = argv[1];
+    if (mode !== undefined && mode !== "auto" && mode !== "ask") {
+      console.error("usage: anvc updates [auto|ask]");
+      process.exitCode = 2;
+      break;
+    }
+    if (mode === undefined) {
+      console.log(`Updates: ${updateMode() === "auto" ? "automatic, two days after a release comes out unless a newer one follows" : "ANVC asks first"}. To change it: anvc updates auto|ask` + (managedBy() === "plugin" ? "" : `
+This copy of ANVC is a ${managedBy() === "git" ? "git clone" : "desktop app"}, which doesn't update itself. The setting is for the Claude Code plugin.`));
+      break;
+    }
+    setUpdateMode(mode);
+    console.log(mode === "auto" ? "ANVC installs a release by itself once it's been out two days with nothing newer." : "ANVC asks before it installs a release.");
+    break;
+  }
   case "update": {
     if (has2("check")) {
-      const s = checkForUpdate();
+      const s = autoUpdate(checkForUpdate());
       console.log(s.error ? `Couldn't check: ${s.error}.` : s.behind ? `${s.behind} update${s.behind === 1 ? "" : "s"} ready:
 ${s.changes.map((c) => `  ${c}`).join(`
 `)}` : updateLine(s) ?? "anvc is up to date.");
@@ -9466,6 +9694,8 @@ ${launcherOnPath() ? "" : `
   anvc forget <id> [...]                   delete private records for good
   anvc unshare <id> [...] | --captured     make records private
   anvc update [--check]                    bring this copy of anvc and its hooks up to date
+  anvc export [DATE ...] [--out FOLDER]     records as Markdown, one page a day; --private adds private ones
+  anvc updates [auto|ask]                  install releases by themselves two days after they come out, or ask first
   anvc sync [--remote NAME]                private history to and from your own remote
   anvc catch-up                            bring in what happened here before anvc was on
   anvc backfill [--write]                  import Claude Code, Codex and Cursor history as private records

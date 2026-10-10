@@ -144,7 +144,7 @@ const LIVE_MS = 30 * 60_000;
 export interface Working {
   title: string | null;
   /** Where the title came from: an item marked doing, the task a subagent was given, or the last thing the person asked. */
-  source: "item" | "task" | "prompt" | null;
+  source: "item" | "task" | "goal" | "prompt" | null;
   item: string | null;
   goal: string | null;
   /** The agent, "You" for an item the person marked. */
@@ -184,14 +184,14 @@ const fromItem = (i: Item): Omit<Working, "agent" | "live"> =>
  * log has a row in the last 30 minutes and no SessionEnd after it; a subagent
  * when its session is, it has a SubagentStart and no SubagentStop, and, when
  * its own tool calls carry its id, one of them is that recent too. What it's
- * on is the item it marked doing, else the task it was given, else the last
- * thing the person asked it. Items marked doing whose session isn't running
+ * on is the item it marked doing, else the task it was given, else the goal
+ * it recorded since the person last asked it something, else that request. Items marked doing whose session isn't running
  * are listed after, as the agent or person left them.
  *
  * Only the last two days of the log are read, so a session older than that
  * reads as starting two days ago. Only Claude Code's hooks report subagents.
  */
-function working(root: string, items: Item[], now: number): Working[] {
+function working(root: string, items: Item[], now: number, db?: Database): Working[] {
   const rows = captureRows(root, undefined, lastDays(2, now)).filter((r) => r.session_id).sort((a, b) => a.ts.localeCompare(b.ts));
   const doing = items.filter((i) => i.state === "doing").sort((a, b) => b.since.localeCompare(a.since));
   const out: Working[] = [];
@@ -208,8 +208,12 @@ function working(root: string, items: Item[], now: number): Working[] {
     for (const i of mine) { said.add(i.id); out.push({ ...fromItem(i), agent, live: true }); }
     if (!mine.length) {
       const asked = list.findLast((r) => r.prompt && !INSERTED.test(r.prompt.trimStart()));
+      // A goal the agent wrote since the prompt names the work better than
+      // the prompt does, which is often dictated and cut off mid-sentence.
+      const goal = asked && db ? (db.prepare(`SELECT intent FROM records WHERE run_id = ? AND ts > ? AND intent_source = 'authored' AND result IS NULL
+        ORDER BY ts DESC LIMIT 1`).get(session, asked.ts) as { intent: string } | null)?.intent : undefined;
       out.push({
-        title: asked ? firstLine(asked.prompt!) : null, source: asked ? "prompt" : null, item: null, goal: null,
+        title: goal ? firstLine(goal) : asked ? firstLine(asked.prompt!) : null, source: goal ? "goal" : asked ? "prompt" : null, item: null, goal: null,
         agent, subagent: null, session, since: asked?.ts ?? list[0]!.ts, live: true, from: null,
       });
     }
@@ -379,7 +383,7 @@ export function readStatus(repo: string, index?: { db: Database; records: Map<st
   const read = (db: Database, records: Map<string, CheckpointRecord>): Status => {
     const items = readItems(records);
     return {
-      now: working(root, items, now),
+      now: working(root, items, now, db),
       done: finished(db, root, items),
       next: upNext(items),
       goals: Object.fromEntries(allGoals(readGoals(db)).map((g) => [g.id, g.from ? `"${g.title}" (from ${g.from})` : g.title])),

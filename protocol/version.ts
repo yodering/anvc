@@ -8,10 +8,12 @@
  * installed, so a repository could miss failure capture or session copies
  * with no sign anything was missing.
  *
- * Updates are never applied by themselves. Code that runs inside every agent
- * session pulling itself is how one bad push reaches everyone at once, so
- * anvc says an update is ready, and `anvc update` or the page's Update button
- * applies it.
+ * A clone is never updated by itself: it can hold someone's work, so anvc
+ * says an update is ready, and `anvc update` or the page's Update button
+ * applies it. The plugin installs a release by itself once it has been out
+ * two days with nothing newer. Installing on the day it came out is how one
+ * bad release reaches everyone at once, and told once instead, people stayed
+ * on the version they had.
  */
 import pkg from "../package.json" with { type: "json" };
 import { spawn } from "node:child_process";
@@ -244,6 +246,10 @@ interface UpdateState {
   changes: string[];
   /** For the plugin, which has no commits to count: the newest released version. */
   latest?: string;
+  /** When `latest` was first seen. */
+  since?: string;
+  /** The last update ANVC installed by itself, or why it couldn't. */
+  installed?: { from?: string; to?: string; error?: string; ts: string };
   error?: string;
 }
 
@@ -281,7 +287,9 @@ export function checkForUpdate(home = HOME): UpdateState {
       stdout: "pipe", stderr: "ignore", env: { ...process.env, GIT_TERMINAL_PROMPT: "0" }, windowsHide: true,
     });
     const latest = tags.success ? newestTag(tags.stdout.toString()) : null;
-    return save(latest ? { checked, behind: 0, changes: [], latest } : { checked, behind: 0, changes: [], error: "couldn't reach the anvc repository" });
+    const before = readJson<UpdateState | null>(updateFile(), null);
+    const since = before?.latest === latest && before?.since ? before.since : checked;
+    return save(latest ? { ...before, checked, behind: 0, changes: [], latest, since, error: undefined } : { ...before, checked, behind: 0, changes: [], error: "couldn't reach the anvc repository" });
   }
   const upstream = gitOrNull(home, ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"]);
   if (!upstream) return save({ checked, behind: 0, changes: [], error: "this copy of anvc has no remote branch to compare with" });
@@ -317,10 +325,53 @@ export function checkDaily(): void {
   } catch { /* no check today */ }
 }
 
+/**
+ * Whether a plugin installs its updates by itself. On unless the person said
+ * otherwise: told once that a release was out, people stayed on the one they
+ * had.
+ */
+export type UpdateMode = "auto" | "ask";
+const modeFile = () => join(stateHome(), "updates.json");
+export const updateMode = (): UpdateMode => readJson<{ mode?: string }>(modeFile(), {}).mode === "ask" ? "ask" : "auto";
+export const updateModeChosen = (): boolean => existsSync(modeFile());
+export const setUpdateMode = (mode: UpdateMode): void => writeJson(modeFile(), { mode });
+
+/**
+ * How long a release is out, with nothing newer, before ANVC installs it by
+ * itself. A release that needs a fix usually gets it within a day, and then
+ * the clock starts again on the fix, so the broken one is skipped.
+ */
+export const SETTLE_MS = 2 * 86_400_000;
+
+/** When the newest release installs itself, or null when it's no newer than `current`. */
+export function settlesAt(state: UpdateState | null, current: string): number | null {
+  if (!state?.latest || !state.since || Bun.semver.order(state.latest, current) <= 0) return null;
+  return Date.parse(state.since) + SETTLE_MS;
+}
+
+/**
+ * Installs the newest release with Claude Code's own commands once it has
+ * settled. Only a plugin: a clone may hold someone's work. The daily check
+ * calls this in the background, so nothing waits on it, and the session that
+ * starts next runs the new version. The one running keeps its own, which
+ * Claude Code leaves on disk.
+ */
+export function autoUpdate(state: UpdateState, now = Date.now()): UpdateState {
+  const at = settlesAt(state, version());
+  if (managedBy() !== "plugin" || updateMode() !== "auto" || at === null || now < at) return state;
+  const done = updatePlugin();
+  if (!done) return state;
+  const ts = new Date(now).toISOString();
+  return save({ ...state, installed: "error" in done ? { error: done.error, ts } : { from: done.from, to: done.to, ts } });
+}
+
 /** One plain line about updates, or null when there is nothing to say. */
 export function updateLine(state: UpdateState | null): string | null {
   if (state?.latest && Bun.semver.order(state.latest, version()) > 0) {
-    return `ANVC ${state.latest} is out, and this is ${version()}. To update, run in a terminal: claude plugin marketplace update anvc && claude plugin update anvc@anvc, then start a new session.`;
+    if (state.installed?.to === state.latest) return `ANVC ${state.latest} is installed. A new session runs it.`;
+    const at = updateMode() === "auto" ? settlesAt(state, version()) : null;
+    const when = at !== null && at > Date.now() ? ` It installs itself on ${new Date(at).toLocaleDateString("en-GB", { day: "numeric", month: "short" })}, two days after it came out, unless a newer one follows.` : "";
+    return `ANVC ${state.latest} is out, and this is ${version()}.${when} To update now, run in a terminal: claude plugin marketplace update anvc && claude plugin update anvc@anvc, then start a new session.`;
   }
   if (!state || !state.behind) return null;
   return `ANVC has ${state.behind} update${state.behind === 1 ? "" : "s"} ready. Run: ${anvcCommand()} update`;
@@ -341,13 +392,16 @@ export function updateOffer(state: UpdateState | null): { text: string; said: ()
   const file = join(stateHome(), "update-offer.json");
   if (readJson<{ offered?: string }>(file, {}).offered === latest) return null;
   const desktop = readJson<{ version?: string }>(desktopFile(), {}).version;
+  // A plugin that updates itself isn't asked about; the version it moved to is said instead.
+  const auto = managedBy() === "plugin" && updateMode() === "auto";
   const steps = [
-    Bun.semver.order(latest, version()) > 0 ? "`claude plugin marketplace update anvc && claude plugin update anvc@anvc`, after which they start a new session" : null,
+    !auto && Bun.semver.order(latest, version()) > 0 ? "`claude plugin marketplace update anvc && claude plugin update anvc@anvc`, after which they start a new session" : null,
     desktop && Bun.semver.order(latest, desktop) > 0 ? `\`${anvcCommand()} desktop install\` for the desktop app, which is ${desktop}` : null,
   ].filter(Boolean);
-  if (!steps.length) return null;
+  const moved = auto && state?.installed?.to === latest && version() === latest ? `ANVC updated itself from ${state.installed.from} to ${latest}. Tell the person in one line.` : null;
+  if (!steps.length && !moved) return null;
   return {
-    text: `anvc: ANVC ${latest} is out. Ask the person whether to update, and if they say yes, run ${steps.join(", and ")}.`,
+    text: `anvc: ${[moved, steps.length ? `ANVC ${latest} is out. Ask the person whether to update, and if they say yes, run ${steps.join(", and ")}.` : null].filter(Boolean).join(" ")}`,
     said: () => { try { writeJson(file, { offered: latest }); } catch { /* asked again next time */ } },
   };
 }

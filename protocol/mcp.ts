@@ -133,8 +133,8 @@ const TOOLS = [
     name: "anvc_search",
     description:
       "Search everything anvc holds: every record's goal, reason, errors, full output, commands and files, this repository's private log of past commands and their output, and the pages and documents agents read here. "
-      + "Use it before retrying something, and when an error looks familiar: paste the error line. Line numbers, addresses and temp paths are ignored, so the same error from another run matches.",
-    inputSchema: { type: "object", properties: { query: { type: "string", description: "Words, a file path, or an error message." }, limit: { type: "number" } }, required: ["query"] },
+      + "Use it before retrying something, and when an error looks familiar: paste the error line. Line numbers, addresses and temp paths are ignored, so the same error from another run matches. A date such as 2026-10-07 keeps what was recorded that day, and a date alone lists it.",
+    inputSchema: { type: "object", properties: { query: { type: "string", description: "Words, a file path, an error message or a date." }, limit: { type: "number" } }, required: ["query"] },
   },
   { name: "anvc_tried", description: "What has already been attempted for a goal? Full-text search over recorded intent. Use before starting work to avoid repeating an approach.",
     inputSchema: { type: "object", properties: { query: { type: "string" }, limit: { type: "number" } }, required: ["query"] } },
@@ -238,7 +238,7 @@ const TOOLS = [
         part: { type: "string", description: "The part of the project it belongs to, so only that part's changes make it stale: \"retrieval\", \"component D\"." },
         source: {
           type: "object",
-          description: "The file it was read from, repository-relative, and where in it: a JSON path, with list items by number (\"test.acc\", \"runs.2.f1\"); a CSV \"row/column\", the row named by its first cell, or by columns when the first cell repeats (\"benchmark=aftraj,horizon=3/auc\"); or the label on a log line. JSON with NaN in it, as Python writes it, reads fine.",
+          description: "The file it was read from, repository-relative, and where in it: a JSON path, with list items by number (\"test.acc\", \"runs.2.f1\"); a CSV or Markdown table's \"row/column\", the row named by its first cell, or by columns when the first cell repeats (\"benchmark=aftraj,horizon=3/auc\"); or the label on a log line. JSON with NaN in it, as Python writes it, reads fine.",
           properties: { path: { type: "string" }, key: { type: "string" } },
           required: ["path"],
         },
@@ -611,9 +611,11 @@ function callTool(name: string, args: Record<string, unknown>): string {
       if (!["helped", "wrong", "stale", "irrelevant"].includes(verdict)) {
         throw new Error("verdict must be helped, wrong, stale or irrelevant");
       }
-      // A verdict is a record like any other, pointing at what it judges with
-      // `supersedes`. Never an edit: the judged record stays exactly as it was
-      // written, because a log that rewrites itself cannot be audited, and a
+      if (!target) throw new Error("name the record you are judging in record");
+      // A verdict is a record like any other, naming what it judges in its
+      // goal. It pointed there with `supersedes`, which showed the judged
+      // record as replaced, even after "helped". Never an edit: the judged
+      // record stays exactly as it was written, because a log that rewrites itself cannot be audited, and a
       // wrong verdict would otherwise destroy the thing it was wrong about.
       //
       // Expect this to be called rarely. Measured elsewhere, an optional tool
@@ -626,10 +628,9 @@ function callTool(name: string, args: Record<string, unknown>): string {
         anvc: 0,
         id: ulid(),
         anchor: headAnchor(repo),
-        ...(target ? { supersedes: target } : {}),
         session: { agent: agentName, run_id: runId() },
         intent: {
-          goal: `Judged a record as ${verdict}`.slice(0, 200),
+          goal: `Judged record ${target} as ${verdict}`.slice(0, 200),
           ...(args.why ? { why: String(args.why).slice(0, 2000) } : {}),
         },
         // A verdict is about a record, not about work, so it is `kept` — it
@@ -641,7 +642,7 @@ function callTool(name: string, args: Record<string, unknown>): string {
       // A verdict goes where the repository's records go by default: it is a
       // finding about shared work more often than not.
       const { ref } = appendRecord(repo, record, { tier: defaultTier(repo) });
-      return `recorded verdict "${verdict}" on ${target || "(no record named)"} at ${ref}\n  id: ${record.id}`;
+      return `recorded verdict "${verdict}" on ${target} at ${ref}\n  id: ${record.id}`;
     }
     case "anvc_result": {
       if (dataMode(repo).mode === "off") return `Keeping track of results is off for this project. The person can turn it on in Settings or with: ${anvcCommand()} data results`;

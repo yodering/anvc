@@ -21,7 +21,7 @@ import { keepSession, keptSessions } from "./keep";
 import { plural } from "./activity";
 import { marker } from "./localonly";
 import { readHead, readJson, stateRoot, writeJson } from "./rawlog";
-import { MANIFEST, skipDir } from "./results";
+import { MANIFEST, sameNumber, skipDir } from "./results";
 import { scrub } from "./scrub";
 import { anvcCommand } from "./version";
 
@@ -37,8 +37,18 @@ const DOCS = /^(README|CHANGELOG|LICENSE|CONTRIBUTING|AGENTS|CLAUDE|CODE_OF_COND
  */
 const MEASURED = /(?<![\d.])\d+\.\d+(?![\d.])|(?<![\d.])\d+(?:\.\d+)?%/g;
 
-/** Whether text holds at least three measured-looking numbers. */
-export const holdsNumbers = (text: string): boolean => (text.match(MEASURED)?.length ?? 0) >= 3;
+/**
+ * Whether text holds at least three measured-looking numbers that aren't
+ * `recorded` values. A report that only repeats recorded results asked for
+ * them to be recorded again on every write.
+ */
+export function holdsNumbers(text: string, recorded: () => string[] = () => []): boolean {
+  const found = text.match(MEASURED) ?? [];
+  if (found.length < 3) return false;
+  // Asked only now: reading every result on each tool call costs a hook more than this check.
+  const known = recorded();
+  return found.filter((n) => !known.some((v) => sameNumber(v, n))).length >= 3;
+}
 
 /** Whether a repository-relative path is a kind of file that can hold results. */
 export function isDataPath(path: string): boolean {
@@ -48,10 +58,10 @@ export function isDataPath(path: string): boolean {
 }
 
 /** Whether a file in the repository holds numbers worth recording. */
-function fileHoldsNumbers(repo: string, path: string): boolean {
+function fileHoldsNumbers(repo: string, path: string, recorded?: () => string[]): boolean {
   if (!isDataPath(path)) return false;
   const text = readHead(join(repo, path), 64 * 1024);
-  return text !== null && holdsNumbers(text);
+  return text !== null && holdsNumbers(text, recorded);
 }
 
 /**
@@ -95,14 +105,14 @@ export function noteWritten(session: string, paths: string[]): void {
  * folder it wrote looked into, as repository-relative paths. `said` leaves
  * out those already spoken about.
  */
-export function writtenData(repo: string, session: string, said: (path: string) => boolean): string[] {
+export function writtenData(repo: string, session: string, said: (path: string) => boolean, recorded?: () => string[]): string[] {
   let paths: string[] = [];
   try { paths = readFileSync(writtenFile(session), "utf8").split("\n").filter(Boolean); } catch { return []; }
   const out = new Set<string>();
   for (const path of new Set(paths)) {
     let inside: string[] = [path];
     try { if (statSync(join(repo, path)).isDirectory()) inside = readdirSync(join(repo, path)).slice(0, 50).map((n) => `${path}/${n}`); } catch { continue; }
-    for (const p of inside) if (!said(p) && fileHoldsNumbers(repo, p)) out.add(p);
+    for (const p of inside) if (!said(p) && fileHoldsNumbers(repo, p, recorded)) out.add(p);
   }
   return [...out];
 }

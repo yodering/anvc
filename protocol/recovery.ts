@@ -12,6 +12,7 @@
 import type { Database } from "bun:sqlite";
 import { editedFiles, sessionRows } from "./evidence";
 import { errorLine, signature } from "./search";
+import { onlyLooks } from "./runs";
 
 export function recovery(db: Database | null, root: string, session: string): string | null {
   const rows = sessionRows(root, session, null);
@@ -24,7 +25,7 @@ export function recovery(db: Database | null, root: string, session: string): st
   // one line with a count.
   const failures = new Map<string, { command: string; times: number; last: string; ts: string }>();
   for (const r of rows) {
-    if (r.tool !== "Bash" || r.ok !== false || !r.command) continue;
+    if (r.tool !== "Bash" || r.ok !== false || !r.command || onlyLooks(r.command)) continue;
     const key = signature(r.command);
     const last = errorLine(r.output ?? "");
     const seen = failures.get(key);

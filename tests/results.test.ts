@@ -53,7 +53,27 @@ test("a value is read from JSON, CSV or a log line", async () => {
   writeFileSync(join(p.repo, "results", "log.txt"), "epoch 9\nval accuracy: 0.8812 (best)\n");
   expect(readValue(join(p.repo, "results", "log.txt"), "val accuracy")).toBe("0.8812");
   expect(fingerprint(join(p.repo, "nope"))).toBeNull();
-  expect(fingerprint(join(p.repo, "results"))?.hash).toMatch(/^folder:/);
+  expect(fingerprint(join(p.repo, "results"))?.hash).toMatch(/^files:/);
+});
+
+test("a folder dependency ignores bytecode, keeps an older fingerprint's meaning, and names what's newer", async () => {
+  const p = project();
+  const folder = join(p.repo, "results");
+  const before = fingerprint(folder)!.hash;
+  const legacy = fingerprint(folder, true)!.hash;
+  const { id } = recordResult(p.repo, { name: "washout", value: "68", depends: ["results"] }, agent);
+  mkdirSync(join(folder, "__pycache__"));
+  writeFileSync(join(folder, "__pycache__", "fit.cpython-311.pyc"), "bytecode");
+  writeFileSync(join(folder, "fit.pyc"), "bytecode");
+  expect(fingerprint(folder)!.hash).toBe(before);
+  expect(fingerprint(folder, true)!.hash).not.toBe(legacy);
+  const view = () => listResults(p.repo).find((r) => r.id === id)!;
+  expect(checkResult(p.repo, view()).stale).toBe(false);
+  await Bun.sleep(5);
+  writeFileSync(join(folder, "new.csv"), "a,b\n1,2\n");
+  const check = checkResult(p.repo, view());
+  expect(check.stale).toBe(true);
+  expect(describe(view(), check)).toContain("results CHANGED (newer: new.csv)");
 });
 
 test("a quoted CSV field keeps its commas, quotes and line breaks in one cell", async () => {
@@ -66,6 +86,18 @@ test("a quoted CSV field keeps its commas, quotes and line breaks in one cell", 
   expect(readValue(csv, "v7/acc")).toBe("0.9");
   // whence reads the file the same way, so the key it gives finds the value.
   expect(whence(p.repo, "0.8823").elsewhere).toMatchObject([{ path: "results/quoted.csv", key: "Results, final/acc", found: "0.8823" }]);
+});
+
+test("a Markdown table is read by row and column, and a key two tables share reads as nothing", () => {
+  const p = project();
+  const md = join(p.repo, "results", "REPORT.md");
+  writeFileSync(md, "# Report\n\n| condition | n | mean |\n|---|---:|---:|\n| constrained | 121 | 0.51 |\n| **All** | 252 | `0.05` |\n\nAll 252 traces.\n");
+  expect(readValue(md, "All/mean")).toBe("0.05");
+  expect(readValue(md, "constrained/n")).toBe("121");
+  // A key that isn't a cell still finds a labelled line, as before.
+  expect(readValue(md, "All")).toBe("252");
+  writeFileSync(md, "| run | mean |\n|---|---|\n| All | 0.05 |\n\n| run | mean |\n|---|---|\n| All | 0.07 |\n");
+  expect(readValue(md, "All/mean")).toBeNull();
 });
 
 test("a CSV key reads back when its row or its column has a slash in it", async () => {

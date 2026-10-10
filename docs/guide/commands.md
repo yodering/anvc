@@ -41,7 +41,8 @@ bun run anvc open                  # this project's work log in the browser; --d
 bun run anvc init                  # make records travel with push and fetch; --off stops them
 bun run anvc catch-up              # bring in the sessions from before ANVC was on, and list the files that hold numbers
 bun run anvc abandoned src/api.ts  # abandoned work touching a file
-bun run anvc search "ETIMEDOUT"    # every record and the command log
+bun run anvc search "ETIMEDOUT"    # every record and the command log; a date such as 2026-10-07 keeps that day's
+bun run anvc export --out docs/log # the records as Markdown, one page a day; private ones only with --private
 bun run anvc sources arxiv.org     # pages, searches and documents agents read; with an id, the text kept
 bun run anvc tried "cache layer"   # what was already attempted
 bun run anvc why src/api.ts:42     # the attempts behind a line, or a whole file
@@ -55,6 +56,7 @@ bun run anvc ingest                # scrape captured events into private records
 bun run anvc policy                # what this project saves and pushes, field by field
 bun run anvc retire                # records taken out of what agents are shown
 bun run anvc brief                 # what happened since you last looked
+bun run anvc updates ask           # ask before installing a release, instead of two days after it comes out
 bun run anvc review                # go through what your next push will share
 bun run anvc forget <id>           # delete a private record for good
 bun run anvc sessions --keep       # keep private copies of this repo's sessions

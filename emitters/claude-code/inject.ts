@@ -660,12 +660,14 @@ try {
   // Numbers in a file the agent is about to write, or that a command it ran
   // wrote: the moment to record the ones that are results, said once a file.
   if (assist.moments.results && event !== "SessionStart" && event !== "PreCompact" && event !== "PostCompact" && dataMode(root).mode !== "off") {
-    const fresh = new Set(writtenData(root, session, (p) => seen.has(`@data:${p}`)));
+    let values: string[] | undefined;
+    const recorded = () => values ??= listResults(root).filter((r) => r.status !== "superseded" && r.status !== "invalid").map((r) => r.value);
+    const fresh = new Set(writtenData(root, session, (p) => seen.has(`@data:${p}`), recorded));
     const target = event === "PreToolUse" && /^(Write|Edit|MultiEdit)$/.test(tool) ? targetPath(payload, repo) : null;
     if (target && isDataPath(target) && !seen.has(`@data:${target}`)) {
       const input = (payload.tool_input ?? {}) as { content?: unknown; new_string?: unknown; edits?: Array<{ new_string?: unknown }> };
       const text = [input.content, input.new_string, ...(input.edits ?? []).map((e) => e.new_string)].filter((t) => typeof t === "string").join("\n");
-      if (holdsNumbers(text)) fresh.add(target);
+      if (holdsNumbers(text, recorded)) fresh.add(target);
     }
     if (fresh.size) say(dataLine([...fresh]), [...fresh].map((p) => `@data:${p}`));
   }

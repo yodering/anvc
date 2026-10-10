@@ -34,14 +34,44 @@ export type Depth = "goal" | "error" | "output" | "file";
 
 export interface RecordHit extends Hit { matched: Depth[] }
 
-/** Records matching every term, best first: a match in the goal outranks one in the output. */
+const DATE = /\b\d{4}-\d{2}(?:-\d{2})?\b/g;
+
+/**
+ * The dates in a query, "2026-10-07" or "2026-10", and the query without
+ * them. The signature strips every number, so a search for a day's work
+ * matched nothing.
+ */
+export function datesIn(query: string): { rest: string; dates: string[] } {
+  return { rest: query.replace(DATE, " "), dates: query.match(DATE) ?? [] };
+}
+
+/** A timestamp's day on this computer's calendar, as 2026-10-07. */
+export function localDay(ts: string): string {
+  const d = new Date(ts);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+}
+
+/** Whether a timestamp falls on one of the dates, on this computer's calendar. With no dates, every one does. */
+export function onDates(ts: string, dates: string[]): boolean {
+  return !dates.length || dates.some((date) => localDay(ts).startsWith(date));
+}
+
+/**
+ * Records matching every term, best first: a match in the goal outranks one
+ * in the output. A date in the query keeps the records made then, and a date
+ * alone lists them, newest first.
+ */
 export function searchRecords(db: Database, query: string, limit = 10): RecordHit[] {
-  const words = terms(query);
+  const { rest, dates } = datesIn(query);
+  const words = terms(rest);
   const match = ftsQuery(words.join(" "));
-  if (!match) return [];
-  const rows = db.prepare(`SELECT s.id AS id, s.prompt AS prompt, s.errors AS errors, s.detail AS detail, s.files AS files,
-      bm25(search, 0, 10, 6, 2, 4) AS rank
-    FROM search s WHERE search MATCH ? ORDER BY rank LIMIT ?`).all(match, limit) as Array<Record<string, string>>;
+  if (!match && !dates.length) return [];
+  const rows = (match
+    ? db.prepare(`SELECT s.id AS id, s.prompt AS prompt, s.errors AS errors, s.detail AS detail, s.files AS files,
+        bm25(search, 0, 10, 6, 2, 4) AS rank
+      FROM search s WHERE search MATCH ? ORDER BY rank LIMIT ?`).all(match, dates.length ? 2000 : limit)
+    : (db.prepare(`SELECT id, ts FROM records ORDER BY ts DESC`).all() as Array<{ id: string; ts: string }>)
+      .filter((r) => onDates(r.ts, dates)).slice(0, limit)) as Array<Record<string, string>>;
   if (!rows.length) return [];
   const byId = new Map(hitsById(db, rows.map((r) => r.id!)).map((h) => [h.id, h]));
   const has = (text: string | undefined) => {
@@ -56,8 +86,8 @@ export function searchRecords(db: Database, query: string, limit = 10): RecordHi
     if (has(r.errors)) matched.push("error");
     if (has(r.files)) matched.push("file");
     if (has(r.detail)) matched.push("output");
-    return [{ ...hit, matched }];
-  });
+    return onDates(hit.ts, dates) ? [{ ...hit, matched }] : [];
+  }).slice(0, limit);
 }
 
 export interface RawHit {
@@ -73,15 +103,17 @@ export interface RawHit {
 }
 
 /**
- * Commands and output in this repository's raw log matching every term,
- * newest first, with repeats of the same error collapsed.
+ * Commands and output in this repository's raw log matching every term, and
+ * from the dates in the query if it names any, newest first, with repeats of
+ * the same error collapsed.
  */
 export function searchRaw(root: string, query: string, limit = 10, captureDir?: string): RawHit[] {
-  const words = terms(query);
-  if (!words.length) return [];
+  const { rest, dates } = datesIn(query);
+  const words = terms(rest);
+  if (!words.length && !dates.length) return [];
   const found = new Map<string, RawHit>();
   for (const row of captureRows(root, captureDir)) {
-    if (!row.command && !row.output) continue;
+    if ((!row.command && !row.output) || !onDates(row.ts, dates)) continue;
     const whole = signature(`${row.command ?? ""}\n${row.output ?? ""}`);
     if (!words.every((w) => whole.includes(w))) continue;
     const line = (row.output ?? "").split("\n").find((l) => words.some((w) => signature(l).includes(w)))?.trim()

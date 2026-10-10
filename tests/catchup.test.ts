@@ -36,6 +36,9 @@ test("numbers are measured ones, and results files hold them where code and docs
   // Versions aren't measurements, and two numbers aren't enough.
   expect(holdsNumbers('"version": "0.4.4", "bun": "1.2.3", "node": "22.1.0"')).toBe(false);
   expect(holdsNumbers("took 0.5 s and 1.5 s")).toBe(false);
+  // A report that only repeats recorded results isn't news.
+  expect(holdsNumbers("mrr 0.418, accuracy 74.6%, 13.5 GPU-hours", () => ["0.418", "74.6%", "13.5"])).toBe(false);
+  expect(holdsNumbers("mrr 0.418, accuracy 74.6%, 13.5 GPU-hours, f1 0.71", () => ["0.418"])).toBe(true);
   expect(["results/run.json", "notes/eval.md", "runs/train.csv", "logs/run.log"].every(isDataPath)).toBe(true);
   expect(["package.json", "README.md", "requirements.txt", "src/train.py", "node_modules/x/data.json", ".github/x.json", "tsconfig.json", "jsconfig.json"].some(isDataPath)).toBe(false);
 });

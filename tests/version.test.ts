@@ -6,7 +6,7 @@ import { expect, test } from "bun:test";
 import { copyFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
-import { anvcCommand, checkForUpdate, desktopFile, hooksBehind, HOOKS_REVISION, installs, newestTag, noteInstall, pullUpdate, readUpdate, updateLine, updateOffer, updatePlugin, version } from "../protocol/version";
+import { anvcCommand, checkForUpdate, desktopFile, hooksBehind, HOOKS_REVISION, installs, newestTag, noteInstall, pullUpdate, readUpdate, setUpdateMode, settlesAt, updateLine, updateOffer, updatePlugin, version } from "../protocol/version";
 import { writeJson } from "../protocol/rawlog";
 import { git, setEnv, tmp } from "./helpers";
 
@@ -113,9 +113,24 @@ test("the plugin is told when a newer release is out, and not when it's on it", 
   expect(newestTag(listed)).toBe("0.4.10");
   expect(newestTag("")).toBeNull();
   const state = (latest: string) => ({ checked: new Date().toISOString(), behind: 0, changes: [], latest });
-  expect(updateLine(state("99.0.0"))).toBe(`ANVC 99.0.0 is out, and this is ${version()}. To update, run in a terminal: claude plugin marketplace update anvc && claude plugin update anvc@anvc, then start a new session.`);
+  expect(updateLine(state("99.0.0"))).toBe(`ANVC 99.0.0 is out, and this is ${version()}. To update now, run in a terminal: claude plugin marketplace update anvc && claude plugin update anvc@anvc, then start a new session.`);
   expect(updateLine(state(version()))).toBeNull();
   expect(updateLine(state("0.0.1"))).toBeNull();
+});
+
+test("a release installs itself two days after it was first seen, and a newer one starts the clock again", () => {
+  setEnv({ ANVC_STATE_HOME: tmp("anvc-settle-") });
+  const day = 86_400_000, seen = Date.parse("2026-10-05T12:00:00Z");
+  const state = (latest: string) => ({ checked: "", behind: 0, changes: [], latest, since: new Date(seen).toISOString() });
+  expect(settlesAt(state("0.4.11"), "0.4.10")).toBe(seen + 2 * day);
+  expect(settlesAt(state("0.4.10"), "0.4.10")).toBeNull();
+  expect(settlesAt({ ...state("0.4.11"), since: undefined }, "0.4.10")).toBeNull();
+  // Said while it hasn't settled, in automatic mode, which is the default.
+  const fresh = { ...state("99.0.0"), since: new Date().toISOString() };
+  expect(updateLine(fresh)).toContain("It installs itself on");
+  expect(updateLine({ ...fresh, installed: { from: version(), to: "99.0.0", ts: "" } })).toBe("ANVC 99.0.0 is installed. A new session runs it.");
+  setUpdateMode("ask");
+  expect(updateLine(fresh)).not.toContain("installs itself");
 });
 
 test("a newer release is offered to the agent once per computer, the desktop app with it when it's behind", () => {

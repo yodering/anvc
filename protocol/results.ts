@@ -99,10 +99,10 @@ export interface Fingerprint { hash: string; bytes: number }
  * marked "sampled:" so nobody mistakes it for a full hash. A folder is the
  * hash of its files' paths, sizes and, for small files, contents.
  */
-export function fingerprint(path: string): Fingerprint | null {
+export function fingerprint(path: string, every = false): Fingerprint | null {
   let stat;
   try { stat = statSync(path); } catch { return null; }
-  if (stat.isDirectory()) return folderPrint(path);
+  if (stat.isDirectory()) return folderPrint(path, every);
   // A file whose size and modification time are as they were keeps its
   // fingerprint, so showing a hundred results doesn't re-read their data.
   const cache = prints();
@@ -149,30 +149,49 @@ function savePrints(): void {
   } catch { /* hashed again next time */ }
 }
 
-function folderPrint(root: string): Fingerprint {
-  const h = createHash("sha256");
-  let bytes = 0, files = 0;
+/**
+ * The files a folder's fingerprint covers, in a fixed order. Caches and
+ * bytecode are left out: a result that depended on a folder was flagged as
+ * changed when Python wrote __pycache__/*.pyc into it. `every` keeps them,
+ * for a fingerprint taken before that, under the "folder:" name.
+ */
+function folderFiles(root: string, every = false): { files: Array<{ path: string; size: number; mtime: number }>; partial: boolean } {
+  const files: Array<{ path: string; size: number; mtime: number }> = [];
   const base = samePath(root);
   const walk = (dir: string) => {
     let names: string[] = [];
     try { names = readdirSync(dir).sort(); } catch { return; }
     for (const name of names) {
-      if (files >= MAX_FOLDER_FILES || name === ".git" || name === "node_modules") continue;
+      if (files.length >= MAX_FOLDER_FILES || name === ".git" || name === "node_modules") continue;
       const path = join(dir, name);
       let stat;
       try { stat = statSync(path); } catch { continue; }
       // A link out of the folder isn't followed: it can point anywhere on this computer.
       try { if (lstatSync(path).isSymbolicLink() && below(base, samePath(path)) === null) continue; } catch { continue; }
-      if (stat.isDirectory()) { walk(path); continue; }
-      files++;
-      bytes += stat.size;
-      // With /, so a folder has one fingerprint on Windows and elsewhere.
-      h.update(`${below(root, path)}\0${stat.size}\0`);
-      if (stat.size <= 256 * 1024) h.update(readFileSync(path));
+      if (stat.isDirectory()) { if (every || !skipDir(name)) walk(path); continue; }
+      if (!every && /\.py[co]$|^\.DS_Store$/.test(name)) continue;
+      files.push({ path, size: stat.size, mtime: stat.mtimeMs });
     }
   };
   walk(root);
-  return { hash: `${files >= MAX_FOLDER_FILES ? "folder-partial" : "folder"}:${h.digest("hex")}`, bytes };
+  return { files, partial: files.length >= MAX_FOLDER_FILES };
+}
+
+function folderPrint(root: string, every = false): Fingerprint {
+  const h = createHash("sha256");
+  const { files, partial } = folderFiles(root, every);
+  for (const f of files) {
+    // With /, so a folder has one fingerprint on Windows and elsewhere.
+    h.update(`${below(root, f.path)}\0${f.size}\0`);
+    if (f.size <= 256 * 1024) h.update(readFileSync(f.path));
+  }
+  const name = every ? "folder" : "files";
+  return { hash: `${partial ? `${name}-partial` : name}:${h.digest("hex")}`, bytes: files.reduce((n, f) => n + f.size, 0) };
+}
+
+/** Up to three files in a folder written after a time, newest first, to name what changed in it. */
+function newerIn(root: string, since: number): string[] {
+  return folderFiles(root).files.filter((f) => f.mtime > since).sort((a, b) => b.mtime - a.mtime).slice(0, 3).map((f) => below(root, f.path)!);
 }
 
 // ------------------------------------------------------------------- values
@@ -239,10 +258,41 @@ function rowsNamed(rows: string[][], name: string): string[][] {
   return rows.slice(1).filter((r) => pairs.every(([col, v]) => r[col] === v));
 }
 
+/** The cell a "row/column" key names in a table whose first row is its header, or null. */
+function cellAt(rows: string[][], key: string): string | null {
+  // Either half can hold a slash: a row named by a file path, a column
+  // named val/acc. values() writes such keys, so every split is tried.
+  for (let at = key.indexOf("/"); at >= 0; at = key.indexOf("/", at + 1)) {
+    const col = rows[0]?.indexOf(key.slice(at + 1)) ?? -1;
+    const hits = col >= 0 ? rowsNamed(rows, key.slice(0, at)) : [];
+    if (hits.length === 1 && hits[0]![col] !== undefined) return hits[0]![col]!;
+  }
+  return null;
+}
+
+/**
+ * Each Markdown table in a text, as rows of cells with the header first. The
+ * |---| line is dropped, and bold or code marks around a cell come off.
+ */
+export function markdownTables(text: string): string[][][] {
+  const tables: string[][][] = [];
+  let rows: string[][] = [];
+  for (const line of [...text.split(/\r?\n/), ""]) {
+    if (!/^\s*\|.*\|\s*$/.test(line)) {
+      if (rows.length > 1) tables.push(rows);
+      rows = [];
+      continue;
+    }
+    const cells = line.trim().slice(1, -1).split("|").map((c) => c.trim().replace(/^[*_`]+|[*_`]+$/g, ""));
+    if (!cells.every((c) => /^:?-+:?$/.test(c))) rows.push(cells);
+  }
+  return tables;
+}
+
 /**
  * The value at `key` in a file, as text, or null.
  *
- * JSON: a dotted path, "test.acc" or "runs.2.f1". CSV and TSV: "row/column",
+ * JSON: a dotted path, "test.acc" or "runs.2.f1". CSV, TSV and Markdown tables: "row/column",
  * the row found by its first cell, or by several columns, as in
  * "benchmark=aftraj,horizon=3/auc". A key that fits more than one row reads
  * as nothing: the first of several rows sharing a first cell gave a number
@@ -262,16 +312,13 @@ export function readValue(path: string, key: string): string | null {
       return at === undefined || (typeof at === "object" && at !== null) ? null : String(at);
     } catch { return null; }
   }
-  if (/\.(csv|tsv)$/i.test(path) && key.includes("/")) {
-    const rows = table(path, text);
-    // Either half can hold a slash: a row named by a file path, a column
-    // named val/acc. values() writes such keys, so every split is tried.
-    for (let at = key.indexOf("/"); at >= 0; at = key.indexOf("/", at + 1)) {
-      const col = rows[0]?.indexOf(key.slice(at + 1)) ?? -1;
-      const hits = col >= 0 ? rowsNamed(rows, key.slice(0, at)) : [];
-      if (hits.length === 1 && hits[0]![col] !== undefined) return hits[0]![col]!;
-    }
-    return null;
+  if (/\.(csv|tsv)$/i.test(path) && key.includes("/")) return cellAt(table(path, text), key);
+  // A report's table read by the line search gave the row's first number: 252
+  // from "| All | 252 | 0.05 |" where 0.05 was meant. A key that fits a cell
+  // in more than one table reads as nothing, as one that fits two rows does.
+  if (/\.(md|markdown)$/i.test(path) && key.includes("/")) {
+    const hits = markdownTables(text).map((rows) => cellAt(rows, key)).filter((v) => v !== null);
+    if (hits.length) return hits.length === 1 ? hits[0]! : null;
   }
   const line = text.split(/\r?\n/).find((l) => l.includes(key));
   const after = line ? line.slice(line.indexOf(key) + key.length) : "";
@@ -562,22 +609,27 @@ export type FileState = "same" | "changed" | "missing" | "unknown";
 
 export interface ResultCheck {
   source: { state: FileState; now: string | null } | null;
-  depends: Array<{ path: string; state: FileState }>;
+  /** For a folder that changed: the files in it written since the result, when there are any. */
+  depends: Array<{ path: string; state: FileState; newer?: string[] }>;
   derived: Array<{ id: string; name: string; status: ResultStatus | "missing" }>;
   /** Something it relies on is different from when it was recorded. */
   stale: boolean;
 }
 
 /** A path's fingerprint, or null when it's missing or links out of the repository, which is never read. */
-const fingerprintInside = (repo: string, path: string): Fingerprint | null => {
+const fingerprintInside = (repo: string, path: string, every = false): Fingerprint | null => {
   const real = realInside(repo, path);
-  return real ? fingerprint(real) : null;
+  return real ? fingerprint(real, every) : null;
 };
 
-/** A path a record names, checked again now. One that links out of the repository counts as missing. */
+/**
+ * A path a record names, checked again now. One that links out of the
+ * repository counts as missing. A folder fingerprinted before caches were
+ * left out is checked the way it was taken, so an update flags nothing.
+ */
 const stateOf = (repo: string, path: string, hash?: string): FileState => {
   if (!hash) return "unknown";
-  const now = fingerprintInside(repo, path);
+  const now = fingerprintInside(repo, path, hash.startsWith("folder"));
   return !now ? "missing" : now.hash === hash ? "same" : "changed";
 };
 
@@ -587,7 +639,12 @@ export function checkResult(repo: string, view: ResultView, all?: ResultView[]):
   const source = view.source
     ? { state: stateOf(repo, view.source.path, view.source.hash), now: view.source.key && real ? readValue(real, view.source.key) : null }
     : null;
-  const depends = view.depends.map((d) => ({ path: d.path, state: stateOf(repo, d.path, d.hash) }));
+  const depends = view.depends.map((d) => {
+    const state = stateOf(repo, d.path, d.hash);
+    const real = state === "changed" && realInside(repo, d.path);
+    const newer = real && statSync(real).isDirectory() ? newerIn(real, Date.parse(view.ts)) : [];
+    return { path: d.path, state, ...(newer.length ? { newer } : {}) };
+  });
   const everyone = all ?? listResults(repo);
   const derived = view.derived_from.map((id) => {
     const from = everyone.find((r) => r.id === id);
@@ -638,7 +695,7 @@ export function describe(view: ResultView, check: ResultCheck, all: ResultView[]
   }
   if (view.command) lines.push(`  made by: ${view.command}${Object.keys(view.settings).length ? ` · ${Object.entries(view.settings).map(([k, v]) => `${k}=${v}`).join(", ")}` : ""}`);
   if (check.depends.length) {
-    lines.push(`  depends on: ${check.depends.map((d) => `${d.path} ${d.state === "same" ? "unchanged" : d.state === "changed" ? "CHANGED" : d.state === "missing" ? "missing" : "?"}`).join(", ")}`);
+    lines.push(`  depends on: ${check.depends.map((d) => `${d.path} ${d.state === "same" ? "unchanged" : d.state === "changed" ? `CHANGED${d.newer ? ` (newer: ${d.newer.join(", ")})` : ""}` : d.state === "missing" ? "missing" : "?"}`).join(", ")}`);
   }
   if (check.derived.length) lines.push(`  computed from: ${check.derived.map((d) => `${d.name} (${d.status})`).join(", ")}`);
   if (view.why) lines.push(`  why: ${view.why.replace(/\s+/g, " ").slice(0, 240)}`);
@@ -684,6 +741,29 @@ function producer(repo: string, path: string): LogRow | null {
   return logRows(repo).filter((r) => r.outputs?.some((o) => o.path === path)).at(-1) ?? null;
 }
 
+/** Each numeric cell of a table, keyed "row/column" so readValue finds that cell and no other. */
+function tableValues(rows: string[][]): Array<{ key: string; value: string }> {
+  const out: Array<{ key: string; value: string }> = [];
+  const header = rows[0] ?? [];
+  const data = rows.slice(1, 5000);
+  // Each row by the fewest leading columns that tell it from every other,
+  // so readValue finds that row and no other.
+  const lead = (r: string[], n: number) => r.slice(0, n).join("\u0000");
+  const counts: Array<Map<string, string[][]>> = [];
+  for (const row of data) {
+    let name: string | null = null;
+    for (let n = 1; n <= header.length && name === null; n++) {
+      const c = counts[n] ??= Map.groupBy(data, (r) => lead(r, n));
+      if (c.get(lead(row, n))!.length !== 1) continue;
+      // Columns or cells holding "," or "=" would make a name that can't be read back apart.
+      if (n > 1 && [...header.slice(0, n), ...row.slice(0, n)].some((v) => /[,=]/.test(v))) break;
+      name = n === 1 ? row[0]! : header.slice(0, n).map((h, i) => `${h}=${row[i]}`).join(",");
+    }
+    if (name !== null) row.forEach((cell, i) => { if (i > 0 && /^-?\d/.test(cell)) out.push({ key: `${name}/${header[i] ?? i}`, value: cell }); });
+  }
+  return out;
+}
+
 /** Every value in a small data file, with the key that finds it again (see readValue). */
 function values(path: string): Array<{ key: string; value: string }> {
   const text = readSmall(path, 4 * 1024 * 1024);
@@ -705,26 +785,12 @@ function values(path: string): Array<{ key: string; value: string }> {
     const lines = Map.groupBy(out, (v) => field(v.key));
     return out.filter((v) => lines.get(field(v.key))!.length <= 100);
   }
-  if (/\.(csv|tsv)$/i.test(path)) {
-    const rows = table(path, text);
-    const header = rows[0] ?? [];
-    const data = rows.slice(1, 5000);
-    // Each row by the fewest leading columns that tell it from every other,
-    // so readValue finds that row and no other.
-    const lead = (r: string[], n: number) => r.slice(0, n).join("\u0000");
-    const counts: Array<Map<string, string[][]>> = [];
-    for (const row of data) {
-      let name: string | null = null;
-      for (let n = 1; n <= header.length && name === null; n++) {
-        const c = counts[n] ??= Map.groupBy(data, (r) => lead(r, n));
-        if (c.get(lead(row, n))!.length !== 1) continue;
-        // Columns or cells holding "," or "=" would make a name that can't be read back apart.
-        if (n > 1 && [...header.slice(0, n), ...row.slice(0, n)].some((v) => /[,=]/.test(v))) break;
-        name = n === 1 ? row[0]! : header.slice(0, n).map((h, i) => `${h}=${row[i]}`).join(",");
-      }
-      if (name !== null) row.forEach((cell, i) => { if (i > 0 && /^-?\d/.test(cell)) out.push({ key: `${name}/${header[i] ?? i}`, value: cell }); });
-    }
-    return out;
+  if (/\.(csv|tsv)$/i.test(path)) return tableValues(table(path, text));
+  if (/\.(md|markdown)$/i.test(path)) {
+    // A key two tables share reads as nothing (see readValue), so it isn't offered.
+    const all = markdownTables(text).flatMap(tableValues);
+    const count = Map.groupBy(all, (v) => v.key);
+    return all.filter((v) => count.get(v.key)!.length === 1);
   }
   if (/\.(txt|log|out|yaml|yml|tex)$/i.test(path)) {
     for (const line of text.split(/\r?\n/).slice(0, 20000)) {

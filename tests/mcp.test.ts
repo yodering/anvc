@@ -215,7 +215,9 @@ test("a verdict on a record is a new record, never an edit", async () => {
   expect(original.outcome.status).toBe("abandoned");
 
   const verdict = JSON.parse(out(["cat-file", "blob", refs[1]!]));
-  expect(verdict.supersedes).toBe(judged);
+  // Named in the goal: with supersedes, the judged record read as replaced.
+  expect(verdict.supersedes).toBeUndefined();
+  expect(verdict.intent.goal).toBe(`Judged record ${judged} as stale`);
   // A verdict is a finding about a record, not a failed attempt of its own.
   expect(verdict.outcome.status).toBe("kept");
   expect(verdict.intent.why).toContain("removed in a refactor");

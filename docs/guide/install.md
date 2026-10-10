@@ -128,7 +128,12 @@ Rust.
 
 ## Updating
 
-ANVC never updates itself. Installed from a clone, it checks once a day
+Installed as a Claude Code plugin, ANVC updates itself. It checks once a day
+for a new release, and installs one when it has been out for two days with
+nothing newer, so a release that needed a quick fix is skipped. The session
+that starts next runs it. To be asked first instead, run `anvc updates ask`.
+
+Installed from a clone, ANVC never updates itself. It checks once a day
 whether a newer version is out, and says so in the line it prints when a
 session ends and at the bottom of the work log's sidebar. To update, click
 Update there, or run:
@@ -141,6 +146,4 @@ That pulls the new version, installs any new dependencies, sets up again
 every repository you set it up in, so hooks added since are installed, and
 updates the Claude Code plugin if it's installed. The work log restarts on
 the new version by itself. Restart your agents afterwards so their ANVC tools
-use it. Installed only as a plugin, update it in Claude Code with `/plugin`,
-where Marketplaces also has an auto-update switch. To update the desktop app,
-run `bun run anvc desktop install` again.
+use it. To update the desktop app, run `bun run anvc desktop install` again.

@@ -47,7 +47,7 @@ export function flags(command: string): Record<string, string> {
 }
 
 /** Programs whose output is what some file already said: a number they print was made elsewhere. */
-const READERS = new Set(["cat", "bat", "head", "tail", "less", "more", "grep", "egrep", "fgrep", "rg", "ag", "ack", "ls", "tree", "find", "fd", "wc", "sed", "echo", "printf", "sort", "uniq", "cut", "tr", "column", "diff", "cmp", "jq", "yq", "file", "stat", "du", "df", "git", "gh", "curl", "wget"]);
+const READERS = new Set(["cat", "bat", "head", "tail", "less", "more", "grep", "egrep", "fgrep", "rg", "ugrep", "ug", "ag", "ack", "ls", "tree", "find", "fd", "wc", "sed", "echo", "printf", "sort", "uniq", "cut", "tr", "column", "diff", "cmp", "jq", "yq", "file", "stat", "du", "df", "git", "gh", "curl", "wget"]);
 /** Shell words after which the next word is the program. */
 const KEYWORDS = new Set(["until", "while", "do", "then", "else", "elif", "if", "!", "{", "("]);
 /** Programs that print nothing a result could come from, and wrappers around the real program. */
@@ -59,7 +59,7 @@ const PREFIXES = new Set(["sudo", "time", "env", "nice", "command", "exec", "xar
  * grep or git. What such a command prints was already in a file, so it
  * isn't where a number came from.
  */
-export function onlyReads(command: string): boolean {
+export function onlyReads(command: string, readers: Set<string> = READERS): boolean {
   let read = false;
   for (const line of command.split("\n")) {
     let start = true;
@@ -69,12 +69,22 @@ export function onlyReads(command: string): boolean {
       start = false;
       const program = w.split("/").at(-1)!;
       if (QUIET.has(program)) continue;
-      if (!READERS.has(program)) return false;
+      if (!readers.has(program)) return false;
       read = true;
     }
   }
   return read;
 }
+
+/** Programs that look for something: when one fails, it found nothing, or was asked wrongly. */
+const LOOKUPS = new Set(["cat", "bat", "head", "tail", "less", "grep", "egrep", "fgrep", "rg", "ugrep", "ug", "ag", "ack", "ls", "tree", "find", "fd", "wc", "stat", "file", "which", "type", "du", "jq", "yq", "sort", "uniq", "cut", "column"]);
+
+/**
+ * Whether a command only looks for something, as grep and ls do. Its failure
+ * is a search that found nothing or a mistyped pattern, which a new session
+ * gained nothing from hearing about.
+ */
+export const onlyLooks = (command: string): boolean => onlyReads(command, LOOKUPS);
 
 /**
  * The step of a compound command that did the work: in "wc -l a.jsonl; tail

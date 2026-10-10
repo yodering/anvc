@@ -109,7 +109,7 @@ test("every command the README and the guide tell people to run exists", async (
   // These take a record id, so the right answer to a file path is a refusal
   // that names the problem — not success, and not a crash.
   const takesId = new Set(["share", "unshare"]);
-  const takesVerb = new Set(["policy", "retire", "local", "assist", "data", "result", "goal", "check", "push-check", "instructions", "rule", "tool", "status", "approve-goals", "desktop"]);
+  const takesVerb = new Set(["policy", "retire", "local", "assist", "data", "result", "goal", "check", "push-check", "instructions", "rule", "tool", "status", "approve-goals", "desktop", "export", "updates"]);
   for (const name of advertised) {
     const { out, code } = cli(repo, name, "refs/cache.ts");
     if (takesId.has(name)) {

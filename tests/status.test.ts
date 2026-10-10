@@ -130,6 +130,21 @@ test("in progress: running sessions and subagents with what each is on, and item
   expect(text).toContain("marked in progress just now by the person");
 }, 30_000);
 
+test("a session's title is the goal its agent recorded since the last prompt, else that prompt", () => {
+  const repo = gitRepo({ commit: true });
+  writeCapture(repo, [
+    { session_id: "s9", event: "UserPromptSubmit", prompt: "ye my bad just a wirte a new compaciton langauge with focus on", ts: ago(5 * MIN) },
+    { session_id: "s9", tool: "Read", ts: ago(1 * MIN) },
+  ]);
+  const title = () => readStatus(repo).now.map((w) => [w.title, w.source]);
+  expect(title()).toEqual([["ye my bad just a wirte a new compaciton langauge with focus on", "prompt"]]);
+  // A goal from before the prompt was for something else.
+  appendRecord(repo, rec({ session: { agent: "claude-code", run_id: "s9" }, intent: { goal: "Fix the old thing" }, ts: ago(9 * MIN) }));
+  expect(title()[0]![1]).toBe("prompt");
+  appendRecord(repo, rec({ session: { agent: "claude-code", run_id: "s9" }, intent: { goal: "Write the compaction summary" }, ts: ago(2 * MIN) }));
+  expect(title()).toEqual([["Write the compaction summary", "goal"]]);
+});
+
 test("a starting subagent's task comes from its parent's session file, one call each", () => {
   const repo = gitRepo({ commit: true });
   const dir = tmp("anvc-status-transcript-");

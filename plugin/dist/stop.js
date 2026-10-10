@@ -300,7 +300,7 @@ function collapse(text) {
 // package.json
 var package_default = {
   name: "anvc",
-  version: "0.4.10",
+  version: "0.4.11",
   private: true,
   type: "module",
   scripts: {
@@ -640,7 +640,9 @@ function checkForUpdate(home = HOME) {
       windowsHide: true
     });
     const latest = tags.success ? newestTag(tags.stdout.toString()) : null;
-    return save(latest ? { checked, behind: 0, changes: [], latest } : { checked, behind: 0, changes: [], error: "couldn't reach the anvc repository" });
+    const before = readJson(updateFile(), null);
+    const since = before?.latest === latest && before?.since ? before.since : checked;
+    return save(latest ? { ...before, checked, behind: 0, changes: [], latest, since, error: undefined } : { ...before, checked, behind: 0, changes: [], error: "couldn't reach the anvc repository" });
   }
   const upstream = gitOrNull(home, ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"]);
   if (!upstream)
@@ -675,9 +677,33 @@ function checkDaily() {
     spawn("bun", [CLI, "update", "--check"], { detached: true, stdio: "ignore", windowsHide: true }).on("error", () => {}).unref();
   } catch {}
 }
+var modeFile = () => join3(stateHome(), "updates.json");
+var updateMode = () => readJson(modeFile(), {}).mode === "ask" ? "ask" : "auto";
+var updateModeChosen = () => existsSync2(modeFile());
+var setUpdateMode = (mode) => writeJson(modeFile(), { mode });
+var SETTLE_MS = 2 * 86400000;
+function settlesAt(state, current) {
+  if (!state?.latest || !state.since || Bun.semver.order(state.latest, current) <= 0)
+    return null;
+  return Date.parse(state.since) + SETTLE_MS;
+}
+function autoUpdate(state, now = Date.now()) {
+  const at = settlesAt(state, version());
+  if (managedBy() !== "plugin" || updateMode() !== "auto" || at === null || now < at)
+    return state;
+  const done = updatePlugin();
+  if (!done)
+    return state;
+  const ts = new Date(now).toISOString();
+  return save({ ...state, installed: "error" in done ? { error: done.error, ts } : { from: done.from, to: done.to, ts } });
+}
 function updateLine(state) {
   if (state?.latest && Bun.semver.order(state.latest, version()) > 0) {
-    return `ANVC ${state.latest} is out, and this is ${version()}. To update, run in a terminal: claude plugin marketplace update anvc && claude plugin update anvc@anvc, then start a new session.`;
+    if (state.installed?.to === state.latest)
+      return `ANVC ${state.latest} is installed. A new session runs it.`;
+    const at = updateMode() === "auto" ? settlesAt(state, version()) : null;
+    const when = at !== null && at > Date.now() ? ` It installs itself on ${new Date(at).toLocaleDateString("en-GB", { day: "numeric", month: "short" })}, two days after it came out, unless a newer one follows.` : "";
+    return `ANVC ${state.latest} is out, and this is ${version()}.${when} To update now, run in a terminal: claude plugin marketplace update anvc && claude plugin update anvc@anvc, then start a new session.`;
   }
   if (!state || !state.behind)
     return null;
@@ -692,14 +718,16 @@ function updateOffer(state) {
   if (readJson(file, {}).offered === latest)
     return null;
   const desktop = readJson(desktopFile(), {}).version;
+  const auto = managedBy() === "plugin" && updateMode() === "auto";
   const steps = [
-    Bun.semver.order(latest, version()) > 0 ? "`claude plugin marketplace update anvc && claude plugin update anvc@anvc`, after which they start a new session" : null,
+    !auto && Bun.semver.order(latest, version()) > 0 ? "`claude plugin marketplace update anvc && claude plugin update anvc@anvc`, after which they start a new session" : null,
     desktop && Bun.semver.order(latest, desktop) > 0 ? `\`${anvcCommand()} desktop install\` for the desktop app, which is ${desktop}` : null
   ].filter(Boolean);
-  if (!steps.length)
+  const moved = auto && state?.installed?.to === latest && version() === latest ? `ANVC updated itself from ${state.installed.from} to ${latest}. Tell the person in one line.` : null;
+  if (!steps.length && !moved)
     return null;
   return {
-    text: `anvc: ANVC ${latest} is out. Ask the person whether to update, and if they say yes, run ${steps.join(", and ")}.`,
+    text: `anvc: ${[moved, steps.length ? `ANVC ${latest} is out. Ask the person whether to update, and if they say yes, run ${steps.join(", and ")}.` : null].filter(Boolean).join(" ")}`,
     said: () => {
       try {
         writeJson(file, { offered: latest });
@@ -2557,14 +2585,26 @@ function signature(text) {
 function terms(query) {
   return [...new Set(signature(query).split(" ").map((t) => t.replace(/^[^\w/.-]+|[^\w/.-]+$/g, "")).filter((t) => t.length > 1))];
 }
+var DATE = /\b\d{4}-\d{2}(?:-\d{2})?\b/g;
+function datesIn(query) {
+  return { rest: query.replace(DATE, " "), dates: query.match(DATE) ?? [] };
+}
+function localDay(ts) {
+  const d = new Date(ts);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+}
+function onDates(ts, dates) {
+  return !dates.length || dates.some((date) => localDay(ts).startsWith(date));
+}
 function searchRecords(db, query, limit = 10) {
-  const words = terms(query);
+  const { rest, dates } = datesIn(query);
+  const words = terms(rest);
   const match = ftsQuery(words.join(" "));
-  if (!match)
+  if (!match && !dates.length)
     return [];
-  const rows = db.prepare(`SELECT s.id AS id, s.prompt AS prompt, s.errors AS errors, s.detail AS detail, s.files AS files,
-      bm25(search, 0, 10, 6, 2, 4) AS rank
-    FROM search s WHERE search MATCH ? ORDER BY rank LIMIT ?`).all(match, limit);
+  const rows = match ? db.prepare(`SELECT s.id AS id, s.prompt AS prompt, s.errors AS errors, s.detail AS detail, s.files AS files,
+        bm25(search, 0, 10, 6, 2, 4) AS rank
+      FROM search s WHERE search MATCH ? ORDER BY rank LIMIT ?`).all(match, dates.length ? 2000 : limit) : db.prepare(`SELECT id, ts FROM records ORDER BY ts DESC`).all().filter((r) => onDates(r.ts, dates)).slice(0, limit);
   if (!rows.length)
     return [];
   const byId = new Map(hitsById(db, rows.map((r) => r.id)).map((h) => [h.id, h]));
@@ -2585,16 +2625,17 @@ function searchRecords(db, query, limit = 10) {
       matched.push("file");
     if (has(r.detail))
       matched.push("output");
-    return [{ ...hit, matched }];
-  });
+    return onDates(hit.ts, dates) ? [{ ...hit, matched }] : [];
+  }).slice(0, limit);
 }
 function searchRaw(root, query, limit = 10, captureDir) {
-  const words = terms(query);
-  if (!words.length)
+  const { rest, dates } = datesIn(query);
+  const words = terms(rest);
+  if (!words.length && !dates.length)
     return [];
   const found = new Map;
   for (const row of captureRows(root, captureDir)) {
-    if (!row.command && !row.output)
+    if (!row.command && !row.output || !onDates(row.ts, dates))
       continue;
     const whole = signature(`${row.command ?? ""}
 ${row.output ?? ""}`);
@@ -2651,1081 +2692,21 @@ function errorLine(output) {
   return (errors.length ? errors.join(" ") : lines.at(-1) ?? "").slice(0, 300);
 }
 
-// protocol/recheck.ts
-import { createHash as createHash3 } from "crypto";
-import { mkdirSync as mkdirSync7, writeFileSync as writeFileSync6 } from "fs";
-import { join as join9 } from "path";
-var COMMANDS = [
-  "bun test",
-  "bun run typecheck",
-  "npm test",
-  "pnpm test",
-  "yarn test",
-  "pytest",
-  "python -m pytest",
-  "python3 -m pytest",
-  "python -m unittest",
-  "python3 -m unittest",
-  "cargo test",
-  "go test",
-  "make test"
-];
-var ARG = /^(?:-[qvx]|(?![-/])(?![A-Za-z]:)(?!(?:.*\/)?\.\.(?:\/|$))[\w./:-]{1,80})$/;
-function argvOf(command) {
-  const text = command.trim();
-  if (!/^[\x21-\x7e]+( [\x21-\x7e]+)*$/.test(text))
-    return null;
-  const head = COMMANDS.find((c) => text === c || text.startsWith(`${c} `));
-  if (!head)
-    return null;
-  const args = text.slice(head.length).split(" ").filter(Boolean);
-  return args.length <= 3 && args.every((a) => ARG.test(a)) ? [...head.split(" "), ...args] : null;
-}
-var runnable = (command) => argvOf(command) !== null;
-var RECHECK_TIMEOUT_MS = 2000;
-function verify(repo, command) {
-  const argv = argvOf(command);
-  if (!argv)
-    return null;
-  try {
-    const proc = Bun.spawnSync(argv, { cwd: repo, stdout: "pipe", stderr: "pipe", timeout: RECHECK_TIMEOUT_MS });
-    if (proc.exitCode === null || proc.exitCode === 9009)
-      return null;
-    return proc.exitCode === 0 ? "checked just now: the check that failed back then passes now, so this may no longer be true; read the current code before following it" : "checked just now: still fails, so this still holds";
-  } catch {
-    return null;
-  }
-}
-var cacheFile = () => join9(stateRoot(), "rechecks.json");
-var readCache = () => readJson(cacheFile(), {});
-function keyFor(repo, command) {
-  const state = gitOrNull(repo, ["rev-parse", "HEAD"]) ?? "";
-  const dirty = gitOrNull(repo, ["diff", "HEAD"]) ?? "";
-  return createHash3("sha256").update(`${repo}\x00${command}\x00${state}\x00${dirty}`).digest("hex").slice(0, 24);
-}
-function cachedCheck(repo, command) {
-  if (!runnable(command))
-    return null;
-  const hit = readCache()[keyFor(repo, command)];
-  return hit ? hit.result : undefined;
-}
-function verifyCached(repo, command) {
-  if (!runnable(command))
-    return null;
-  const key = keyFor(repo, command);
-  const cache = readCache();
-  if (key in cache)
-    return cache[key].result;
-  const result = verify(repo, command);
-  cache[key] = { result, ts: new Date().toISOString() };
-  const entries = Object.entries(cache).sort((a, b) => b[1].ts.localeCompare(a[1].ts)).slice(0, 200);
-  try {
-    mkdirSync7(join9(cacheFile(), ".."), { recursive: true });
-    writeFileSync6(cacheFile(), JSON.stringify(Object.fromEntries(entries)));
-  } catch {}
-  return result;
-}
-
-// protocol/evidence.ts
-var EDITS = new Set(["Edit", "Write", "MultiEdit", "NotebookEdit"]);
-function editedFiles(rows, root) {
-  const toRepo = inRepo(root);
-  return [...new Set(rows.filter((r) => r.tool && EDITS.has(r.tool)).map((r) => toRepo(r.path)).filter((p) => p !== null))];
-}
-function sessionRows(root, session, since) {
-  return captureRows(root, undefined, lastDays(2), [JSON.stringify(session)]).filter((row) => row.session_id === session && (!since || row.ts > since)).sort((a, b) => a.ts.localeCompare(b.ts));
-}
-function fillEvidence(record, rows, root) {
-  const filled = { commands: 0, failure: null, files: 0, recheck: null };
-  const commands = rows.filter((r) => r.tool === "Bash" && r.command).map((r) => r.command);
-  const failed = record.outcome.status === "abandoned" ? rows.filter((r) => r.tool === "Bash" && r.ok === false && r.command).at(-1) : undefined;
-  const edited = editedFiles(rows, root);
-  let output = false, errors = false;
-  const detail = { ...record.detail ?? {} };
-  if (!detail.commands?.length && commands.length) {
-    detail.commands = commands.slice(-MAX_DETAIL_ITEMS);
-    filled.commands = detail.commands.length;
-  }
-  if (!detail.output && failed?.output) {
-    detail.output = `$ ${failed.command}
-${failed.output}`.slice(0, MAX_DETAIL_BYTES);
-    output = true;
-  }
-  if (Object.keys(detail).length)
-    record.detail = detail;
-  if (!record.outcome.errors?.length && failed) {
-    const last = errorLine(failed.output ?? "");
-    let error = `${failed.command}${last ? `: ${last}` : " failed"}`.slice(0, MAX_ERROR_BYTES);
-    while (Buffer.byteLength(error, "utf8") > MAX_ERROR_BYTES)
-      error = error.slice(0, -1);
-    record.outcome.errors = [error];
-    errors = true;
-  }
-  if (record.outcome.status === "abandoned" && !record.outcome.recheck) {
-    const test = rows.filter((r) => r.tool === "Bash" && r.ok === false && r.command && runnable(r.command)).at(-1);
-    if (test) {
-      record.outcome.recheck = test.command.trim();
-      filled.recheck = record.outcome.recheck;
-    }
-  }
-  if (!record.delta?.files?.length && edited.length) {
-    record.delta = { ...record.delta ?? {}, files: edited.slice(0, 500) };
-    filled.files = edited.length;
-  }
-  fit2(record, filled, output);
-  if (output && record.detail?.output || errors)
-    filled.failure = failed.command;
-  return filled;
-}
-function fit2(record, filled, output) {
-  const over = () => Buffer.byteLength(canonical(record), "utf8") > MAX_RECORD_BYTES;
-  const detail = record.detail;
-  while (filled.commands && detail?.commands?.length && over()) {
-    detail.commands = detail.commands.slice(Math.ceil(detail.commands.length / 2));
-    filled.commands = detail.commands.length;
-    record.truncated = true;
-  }
-  while (output && detail?.output && (over() || Buffer.byteLength(detail.output, "utf8") > MAX_DETAIL_BYTES)) {
-    const half = Math.floor(detail.output.length / 2);
-    record.truncated = true;
-    if (half < 400) {
-      delete detail.output;
-      break;
-    }
-    detail.output = headTail(detail.output, half);
-  }
-  while (filled.files && record.delta?.files?.length && over()) {
-    record.delta.files = record.delta.files.slice(0, Math.floor(record.delta.files.length / 2));
-    filled.files = record.delta.files.length;
-    record.truncated = true;
-  }
-  if (detail?.commands?.length === 0)
-    delete detail.commands;
-  if (record.delta?.files?.length === 0)
-    delete record.delta.files;
-}
-
-// protocol/handoff.ts
-function recent(root, dir, since) {
-  const mentions = [...new Set([root, samePath(root)])].map((p) => JSON.stringify(p));
-  return captureRows(root, dir, lastDays(3), mentions).filter((row) => Date.parse(row.ts) >= since).sort((a, b) => a.ts.localeCompare(b.ts));
-}
-var ago = (ms) => {
-  const m = Math.round(ms / 60000);
-  if (m < 1)
-    return "just now";
-  if (m < 60)
-    return `${m} min ago`;
-  const h = Math.round(m / 60);
-  return `${h} hour${h === 1 ? "" : "s"} ago`;
-};
-function handoff(root, current, opts = {}) {
-  const now = Date.now();
-  const rows = recent(root, opts.captureDir, now - 24 * 3600000).filter((r) => r.session_id && r.session_id !== current);
-  if (!rows.length)
-    return null;
-  const last = rows.at(-1);
-  const session = last.session_id;
-  const mine = rows.filter((r) => r.session_id === session);
-  const agent = AGENT_NAMES[last.agent ?? "claude-code"] ?? last.agent ?? "An agent";
-  const edited = editedFiles(mine, root);
-  const failed = mine.filter((r) => r.tool === "Bash" && r.ok === false).at(-1);
-  const record = opts.db?.prepare(`SELECT intent, status FROM records WHERE run_id = ? AND TRIM(intent) != '' AND result IS NULL ORDER BY ts DESC LIMIT 1`).get(session);
-  if (!edited.length && !failed && !record)
-    return null;
-  const dirty = new Set((gitOrNull(root, ["status", "--porcelain"]) ?? "").split(`
-`).map((l) => l.slice(3).trim()).filter(Boolean));
-  const open = edited.filter((f) => dirty.has(f)).length;
-  const lines = [`Before this session, ${agent} worked in this repository (${ago(now - Date.parse(last.ts))}).`];
-  lines.push(record ? `  Last recorded: "${record.intent.replace(/\s+/g, " ").slice(0, 120)}" (${record.status})` : "  It recorded nothing, so this is all that is known.");
-  if (edited.length) {
-    const shown = edited.slice(0, 4).join(", ") + (edited.length > 4 ? ` and ${edited.length - 4} more` : "");
-    lines.push(`  Changed: ${shown}${open ? `; ${open === edited.length ? "all" : open} still uncommitted` : ""}`);
-  }
-  if (failed?.command) {
-    const why = errorLine(failed.output ?? "");
-    lines.push(`  Last failure: \`${failed.command.slice(0, 100)}\`${why ? ` \u2192 ${why.slice(0, 120)}` : ""}`);
-  }
-  const transcript = mine.map((r) => r.transcript).filter(Boolean).at(-1);
-  if (transcript)
-    lines.push(`  Its full session, if you need more: ${transcript}`);
-  return lines.join(`
-`);
-}
-var capturedEdits = (root, session) => editedFiles(recent(root, undefined, Date.now() - 2 * 86400000).filter((r) => r.session_id === session), root);
-
-// protocol/keep.ts
-import { createHash as createHash4 } from "crypto";
-import { appendFileSync as appendFileSync2, closeSync as closeSync3, existsSync as existsSync5, mkdirSync as mkdirSync8, openSync as openSync3, readFileSync as readFileSync5, readdirSync as readdirSync2, readSync as readSync3, renameSync as renameSync2, rmSync as rmSync3, statSync as statSync3, truncateSync, writeFileSync as writeFileSync7 } from "fs";
-import { homedir as homedir7 } from "os";
-import { basename as basename3, join as join10 } from "path";
-import { constants as constants2, gunzipSync } from "zlib";
-var keptRoot = () => process.env.ANVC_KEPT_DIR ?? join10(homedir7(), ".anvc", "transcripts");
-var THROTTLE_MS = 5 * 60000;
-function destination(repo, agent, session, source, root) {
-  const safe = session.replace(/[^\w.-]/g, "-");
-  return join10(root, repoKey(repo), agent, source.endsWith(".zst") ? `${safe}.jsonl.zst` : `${safe}.jsonl.gz`);
-}
-function keepSession(repo, agent, session, source, opts = {}) {
-  const root = opts.root ?? keptRoot();
-  try {
-    if (!session || !source || !existsSync5(source))
-      return null;
-    if (readPolicy(repo).fields.transcripts === "off")
-      return null;
-    const dest = destination(repo, agent, session, source, root);
-    if (existsSync5(dest)) {
-      const copied = statSync3(dest).mtimeMs;
-      if (copied >= statSync3(source).mtimeMs)
-        return dest;
-      if (!opts.force && Date.now() - copied < THROTTLE_MS)
-        return dest;
-    }
-    mkdirSync8(join10(dest, ".."), { recursive: true, mode: 448 });
-    if (dest.endsWith(".gz") && appendNew(source, dest))
-      return dest;
-    rmSync3(markOf(dest), { force: true });
-    const raw = readFileSync5(source);
-    const body = dest.endsWith(".gz") ? Bun.gzipSync(raw) : raw;
-    const tmp = `${dest}.tmp`;
-    writeFileSync7(tmp, body, { mode: 384 });
-    renameSync2(tmp, dest);
-    if (dest.endsWith(".gz"))
-      mark(dest, raw.length, raw);
-    return dest;
-  } catch {
-    return null;
-  }
-}
-var markOf = (dest) => `${dest}.at`;
-var TAIL = 4096;
-var hash = (bytes) => createHash4("sha256").update(bytes).digest("hex");
-function mark(dest, source, tail) {
-  writeJson(markOf(dest), { source, copy: statSync3(dest).size, tail: hash(tail.subarray(Math.max(0, tail.length - TAIL))) });
-}
-function appendNew(source, dest) {
-  const at = readJson(markOf(dest), null);
-  if (!at || !existsSync5(dest))
-    return false;
-  const size = statSync3(source).size;
-  const copy = statSync3(dest).size;
-  if (size < at.source || copy < at.copy)
-    return false;
-  const from = Math.max(0, at.source - TAIL);
-  const read = Buffer.alloc(size - from);
-  const fd = openSync3(source, "r");
-  try {
-    readSync3(fd, read, 0, read.length, from);
-  } finally {
-    closeSync3(fd);
-  }
-  const before = read.subarray(0, at.source - from);
-  if (hash(before) !== at.tail)
-    return false;
-  const added = read.subarray(at.source - from);
-  if (copy > at.copy)
-    truncateSync(dest, at.copy);
-  if (added.length)
-    appendFileSync2(dest, Bun.gzipSync(added));
-  mark(dest, size, read);
-  return true;
-}
-function readKept(path) {
-  try {
-    const raw = readFileSync5(path);
-    if (path.endsWith(".gz"))
-      return gunzipSync(raw, { finishFlush: constants2.Z_SYNC_FLUSH }).toString("utf8");
-    if (path.endsWith(".jsonl"))
-      return raw.toString("utf8");
-    return null;
-  } catch {
-    return null;
-  }
-}
-function keptSessions(repo, root = keptRoot()) {
-  const out = [];
-  for (const base of [join10(root, repoKey(repo)), join10(root, legacyKey(repo))]) {
-    let agents = [];
-    try {
-      agents = readdirSync2(base);
-    } catch {
-      continue;
-    }
-    for (const agent of agents) {
-      let names = [];
-      try {
-        names = readdirSync2(join10(base, agent));
-      } catch {
-        continue;
-      }
-      for (const name of names) {
-        if (!/\.jsonl(\.gz|\.zst)?$/.test(name))
-          continue;
-        const path = join10(base, agent, name);
-        try {
-          out.push({ agent, session: basename3(name).replace(/\.jsonl(\.gz|\.zst)?$/, ""), path, bytes: statSync3(path).size });
-        } catch {}
-      }
-    }
-  }
-  return out;
-}
-
-// protocol/backfill.ts
-import { existsSync as existsSync7, readdirSync as readdirSync3, readFileSync as readFileSync7, statSync as statSync4 } from "fs";
-import { isAbsolute as isAbsolute4, join as join12 } from "path";
-import { fileURLToPath } from "url";
-
-// protocol/ingest.ts
-import { existsSync as existsSync6, readFileSync as readFileSync6 } from "fs";
-import { isAbsolute as isAbsolute3, join as join11 } from "path";
-
-// protocol/shell-paths.ts
-function literal(token) {
-  if (!token)
-    return null;
-  const value = token.replace(/^['"]|['"]$/g, "");
-  if (!value || /[$*?`]/.test(value))
-    return null;
-  if (value === "/dev/null" || value.startsWith("-"))
-    return null;
-  if (/[=(){}!,;]|^\d+$/.test(value))
-    return null;
-  if (!SEPARATOR.test(value) && !/^[\w.-]+\.[a-z0-9]{1,8}$/i.test(value))
-    return null;
-  if (value.length > 4096)
-    return null;
-  return value;
-}
-var SEPARATOR = process.platform === "win32" ? /\/|\\(?!$)/ : /\//;
-var READ_COMMANDS = new Set(["cat", "head", "tail", "less", "grep", "rg", "wc", "diff", "md5sum", "sha256sum", "jq", "sort", "uniq"]);
-var WRITE_COMMANDS = new Set(["touch", "mkdir", "rm", "cp", "mv", "tee", "shred"]);
-function shellPaths(command) {
-  const found = new Map;
-  const add = (path, kind) => {
-    if (!path)
-      return;
-    if (kind === "write" || !found.has(path))
-      found.set(path, kind);
-  };
-  for (const match of command.matchAll(/(?<![0-9&])>>?\s*(['"]?[^\s;|&()'"]+['"]?)/g))
-    add(literal(match[1]), "write");
-  for (const match of command.matchAll(/(?<!<)<(?!<)\s*(['"]?[^\s;|&()'"]+['"]?)/g))
-    add(literal(match[1]), "read");
-  for (const match of command.matchAll(/\bsed\s+(?:-[a-zA-Z]*i[a-zA-Z]*\S*\s+)(?:(?:-e\s+)?(['"]).*?\1\s+)?(\S+)/g))
-    add(literal(match[2]), "write");
-  for (const match of command.matchAll(/open\(\s*(['"])([^'"]+)\1\s*(?:,\s*(['"])([rwa])[^'"]*\3)?/g)) {
-    const mode = match[4] ?? "r";
-    add(literal(match[2]), mode === "r" ? "read" : "write");
-  }
-  for (const segment of command.split(/[;|]|&&|\|\||\n/)) {
-    const bare = segment.replace(/<<-?\s*(['"]?)\w+\1/g, " ").replace(/[0-9&]?>>?\s*[^\s;|&()]*/g, " ").replace(/<\s*\([^)]*\)/g, " ").replace(/(?<!<)<(?!<)\s*[^\s;|&()]*/g, " ");
-    const tokens = bare.trim().split(/\s+/);
-    let head = tokens[0];
-    let rest = tokens.slice(1);
-    while (head && ["sudo", "env", "time", "nohup"].includes(head)) {
-      head = rest[0];
-      rest = rest.slice(1);
-    }
-    if (!head)
-      continue;
-    const name = head.split("/").pop();
-    const operands = rest.filter((t) => !t.startsWith("-"));
-    const patternFirst = name === "grep" || name === "rg";
-    if (READ_COMMANDS.has(name)) {
-      for (const operand of patternFirst ? operands.slice(1) : operands)
-        add(literal(operand), "read");
-    } else if (WRITE_COMMANDS.has(name)) {
-      if ((name === "cp" || name === "mv") && operands.length >= 2) {
-        add(literal(operands[0]), "read");
-        add(literal(operands.at(-1)), "write");
-      } else
-        for (const operand of operands)
-          add(literal(operand), "write");
-    }
-  }
-  return [...found].map(([path, kind]) => ({ path, kind }));
-}
-
-// protocol/ingest.ts
-var DELEGATE_TOOLS = new Set(["Task", "Agent"]);
-function readCapture(path) {
-  return readFileSync6(path, "utf8").trim().split(`
-`).filter(Boolean).map((line) => JSON.parse(line)).filter((e) => e.anvc_capture === 0);
-}
-function uncommitted(repo) {
-  const changed = gitOrNull(repo, ["diff", "--name-only", "-z", "HEAD"]) ?? "";
-  const added = gitOrNull(repo, ["ls-files", "--others", "--exclude-standard", "-z"]) ?? "";
-  return new Set(`${changed}\x00${added}`.split("\x00").filter(Boolean));
-}
-function toRecords(events, repo, checkpoints = new Map, opts = {}) {
-  const bySession = Map.groupBy(events.filter((e) => e.session_id), (e) => e.session_id);
-  const turns = [];
-  for (const stream of bySession.values()) {
-    stream.sort((a, b) => a.ts.localeCompare(b.ts));
-    let current = [];
-    for (const event of stream) {
-      if (event.event === "UserPromptSubmit" && current.length) {
-        turns.push({ events: current, until: Date.parse(event.ts) });
-        current = [];
-      }
-      current.push(event);
-    }
-    if (current.length)
-      turns.push({ events: current, until: Infinity });
-  }
-  const head = gitOrNull(repo, ["rev-parse", "HEAD"]);
-  const dirty = uncommitted(repo);
-  const toRepo = inRepo(repo);
-  const records = [];
-  for (const { events: turn, until } of turns) {
-    const prompt = turn.find((e) => e.prompt)?.prompt;
-    if (!prompt)
-      continue;
-    const session = turn[0].session_id;
-    const from = Date.parse(turn[0].ts);
-    if (checkpoints.get(session)?.some((t) => t >= from && t < until))
-      continue;
-    const actions = [];
-    const written = new Set;
-    const guessed = new Set;
-    const failures = [];
-    const delegations = [];
-    const outputs = [];
-    for (const event of turn) {
-      if (event.tool && DELEGATE_TOOLS.has(event.tool) && event.delegated) {
-        delegations.push(event.agent_type ? `${event.delegated} (${event.agent_type})` : event.delegated);
-        continue;
-      }
-      if (event.tool === "Read" && event.path)
-        actions.push({ kind: "read", path: event.path, ts: event.ts });
-      else if (event.path && (event.tool === "Edit" || event.tool === "Write" || event.tool === "NotebookEdit")) {
-        actions.push({ kind: "write", path: event.path, bytes: event.bytes ?? undefined, ts: event.ts });
-        written.add(event.path);
-      } else if (event.tool === "Bash" && event.command) {
-        actions.push({ kind: "shell", command: event.command.slice(0, 512), ts: event.ts });
-        if (event.ok === false) {
-          failures.push(`failed: ${event.command.slice(0, 200)}`);
-          if (event.output)
-            outputs.push(`$ ${event.command.slice(0, 200)}
-${event.output}`);
-        }
-        const moved = /(^|[;&|]\s*)cd\s/.test(event.command);
-        for (const { path, kind } of shellPaths(event.command)) {
-          if (moved && !isAbsolute3(path))
-            continue;
-          const absolute = isAbsolute3(path) ? path : join11(event.cwd, path);
-          actions.push({ kind, path: absolute, ts: event.ts });
-          if (kind === "write") {
-            written.add(absolute);
-            guessed.add(absolute);
-          }
-        }
-      }
-    }
-    const relative = [...new Set([...written].map((p) => [p, toRepo(p)]).filter(([p, rel]) => rel !== null && (!guessed.has(p) || existsSync6(p) || gitOrNull(repo, ["log", "-1", "--format=%H", "--all", "--", rel]))).map(([, rel]) => rel))];
-    const abandoned = relative.length > 0 && (opts.fresh ? relative.every((p) => !dirty.has(p) && !gitOrNull(repo, ["log", "-1", "--format=%H", `--since=${turn[0].ts}`, "--", p])) : relative.every((p) => dirty.has(p)));
-    if (!relative.length && !failures.length && !delegations.length)
-      continue;
-    records.push({
-      anvc: 0,
-      id: contentUlid([session, turn[0].ts, prompt], new Date(turn[0].ts).getTime()),
-      anchor: head ? { kind: "commit", oid: head } : { kind: "blob", oid: "0".repeat(40) },
-      session: { agent: turn[0].agent ?? "claude-code", run_id: session },
-      intent: delegations.length ? { goal: `Delegated: ${delegations.join("; ")}`.slice(0, 200) } : {},
-      actions: actions.slice(0, 1000),
-      delta: relative.length ? { files: relative } : undefined,
-      outcome: {
-        status: abandoned ? "abandoned" : "kept",
-        ...failures.length ? { errors: failures.slice(0, 20) } : {},
-        ...abandoned && delegations.length ? { recheck: null } : {}
-      },
-      ...outputs.length ? { detail: { output: headTail(outputs.join(`
-
-`), 24 * 1024) } } : {},
-      ts: turn.at(-1).ts,
-      ...actions.length > 1000 ? { truncated: true } : {}
-    });
-  }
-  return records;
-}
-function fit3(record) {
-  const size = (r) => Buffer.byteLength(canonical(r), "utf8");
-  if (size(record) <= MAX_RECORD_BYTES)
-    return record;
-  const trimmed = { ...record, truncated: true };
-  while (trimmed.detail?.output && size(trimmed) > MAX_RECORD_BYTES) {
-    const half = Math.floor(trimmed.detail.output.length / 2);
-    if (half < 400) {
-      trimmed.detail = { ...trimmed.detail, output: undefined };
-      break;
-    }
-    trimmed.detail = { ...trimmed.detail, output: headTail(trimmed.detail.output, half) };
-  }
-  while (trimmed.actions?.length && size(trimmed) > MAX_RECORD_BYTES) {
-    trimmed.actions = trimmed.actions.slice(0, Math.floor(trimmed.actions.length / 2));
-  }
-  if (size(trimmed) > MAX_RECORD_BYTES)
-    trimmed.actions = [];
-  return trimmed;
-}
-function ingest(repo, events, opts = {}) {
-  const here = isRepo(repo);
-  const forRepo = events.filter((e) => here(e.repo));
-  const stored = new Set;
-  const checkpoints = new Map;
-  for (const [, r] of readRecords(repo)) {
-    stored.add(r.id);
-    if (typeof r.intent.goal === "string") {
-      (checkpoints.get(r.session.run_id) ?? checkpoints.set(r.session.run_id, []).get(r.session.run_id)).push(Date.parse(r.ts));
-    }
-  }
-  const records = toRecords(forRepo, repo, checkpoints, { fresh: opts.fresh });
-  let written = 0, skipped = 0;
-  const failed = [], ids = [];
-  const seen = new Set;
-  for (const record of records) {
-    if (stored.has(record.id) || seen.has(record.id)) {
-      skipped++;
-      continue;
-    }
-    seen.add(record.id);
-    try {
-      appendRecord(repo, fit3(record), { tier: "private" });
-      written++;
-      ids.push(record.id);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      if (message.includes("Refusing to overwrite"))
-        skipped++;
-      else
-        failed.push(`${record.id}: ${message}`);
-    }
-  }
-  return { written, skipped, failed, ids };
-}
-
-// protocol/backfill.ts
-function transcriptDir(repo, root = join12(claudeDir(), "projects")) {
-  return join12(root, repo.replace(/[\\/:_]/g, "-"));
-}
-function readOr(path, text) {
-  if (text !== undefined)
-    return text;
-  try {
-    return readFileSync7(path, "utf8");
-  } catch {
-    return null;
-  }
-}
-function readTranscript(path, scrub, seen, text) {
-  const raw = readOr(path, text);
-  if (raw === null)
-    return [];
-  const lines = [];
-  for (const line of raw.split(`
-`)) {
-    if (!line.trim())
-      continue;
-    try {
-      lines.push(JSON.parse(line));
-    } catch {}
-  }
-  const results = new Map;
-  for (const line of lines) {
-    if (line.type !== "user" || !Array.isArray(line.message?.content))
-      continue;
-    for (const block of line.message.content) {
-      if (block.type !== "tool_result" || !block.tool_use_id)
-        continue;
-      results.set(block.tool_use_id, {
-        ok: !block.is_error,
-        output: textOf(block.content)
-      });
-    }
-  }
-  const events = [];
-  for (const line of lines) {
-    const ts = line.timestamp;
-    const session = line.sessionId ?? null;
-    const cwd = line.cwd ?? "";
-    if (!ts)
-      continue;
-    if (line.type === "user" && typeof line.message?.content === "string") {
-      const text = line.message.content.trim();
-      if (!text || /^<(task-notification|system-reminder|local-command|command-)/.test(text))
-        continue;
-      if (line.uuid && seen) {
-        if (seen.has(line.uuid))
-          continue;
-        seen.add(line.uuid);
-      }
-      events.push({
-        anvc_capture: 0,
-        event: "UserPromptSubmit",
-        ts,
-        session_id: session,
-        cwd,
-        repo: null,
-        tool: null,
-        path: null,
-        bytes: null,
-        command: null,
-        prompt: scrub(text).slice(0, 8192),
-        ok: null
-      });
-      continue;
-    }
-    if (line.type !== "assistant" || !Array.isArray(line.message?.content))
-      continue;
-    for (const block of line.message.content) {
-      if (block.type !== "tool_use" || !block.name)
-        continue;
-      const key = `${line.uuid ?? ""}|${block.id ?? ""}`;
-      if (line.uuid && seen) {
-        if (seen.has(key))
-          continue;
-        seen.add(key);
-      }
-      const input = block.input ?? {};
-      const result = block.tool_use_id ? undefined : results.get(String(block.id ?? ""));
-      const path = input.file_path ?? input.path ?? input.notebook_path;
-      const command = typeof input.command === "string" ? input.command : null;
-      events.push({
-        anvc_capture: 0,
-        event: "PostToolUse",
-        ts,
-        session_id: session,
-        cwd,
-        repo: null,
-        tool: block.name,
-        path: path ? String(path) : null,
-        bytes: typeof input.content === "string" ? input.content.length : typeof input.new_string === "string" ? input.new_string.length : null,
-        command: command ? scrub(command).slice(0, 512) : null,
-        prompt: null,
-        ok: result ? result.ok : null,
-        output: result?.output ? keepOutput(result.output, scrub) : null,
-        delegated: DELEGATE_TOOLS.has(block.name) && typeof input.description === "string" ? scrub(String(input.description)).slice(0, 200) : null,
-        agent_type: DELEGATE_TOOLS.has(block.name) && typeof input.subagent_type === "string" ? String(input.subagent_type).slice(0, 64) : null
-      });
-    }
-  }
-  return events;
-}
-function codexSessions(root = join12(codexDir(), "sessions")) {
-  const out = [];
-  const walk = (dir) => {
-    let names = [];
-    try {
-      names = readdirSync3(dir);
-    } catch {
-      return;
-    }
-    for (const name of names) {
-      const full = join12(dir, name);
-      if (name.endsWith(".jsonl") && name.startsWith("rollout-"))
-        out.push(full);
-      else if (/^\d+$/.test(name))
-        walk(full);
-    }
-  };
-  walk(root);
-  return out.sort();
-}
-function codexMeta(path) {
-  try {
-    const head = readHead(path, 256 * 1024) ?? "";
-    const first = (head.includes(`
-`) ? head : readFileSync7(path, "utf8")).split(`
-`, 1)[0] ?? "";
-    const row = JSON.parse(first);
-    if (row.type !== "session_meta")
-      return { id: null, cwd: null };
-    return {
-      id: typeof row.payload?.id === "string" ? row.payload.id : null,
-      cwd: typeof row.payload?.cwd === "string" ? pathOf(row.payload.cwd) : null
-    };
-  } catch {
-    return { id: null, cwd: null };
-  }
-}
-function sessionFiles(repo, opts = {}) {
-  const out = [];
-  const dir = transcriptDir(repo, opts.root);
-  try {
-    for (const name of readdirSync3(dir)) {
-      if (name.endsWith(".jsonl"))
-        out.push({ agent: "claude-code", session: name.slice(0, -6), path: join12(dir, name) });
-    }
-  } catch {}
-  for (const path of codexSessions(opts.codexRoot)) {
-    const meta = codexMeta(path);
-    if (meta.id && meta.cwd && repoOf(meta.cwd, repo))
-      out.push({ agent: "codex", session: meta.id, path });
-  }
-  for (const { session, path } of cursorSessions(repo))
-    out.push({ agent: "cursor", session, path });
-  return out;
-}
-function readCodexSession(path, scrub, text) {
-  const raw = readOr(path, text);
-  if (raw === null)
-    return [];
-  let session = null;
-  let cwd = "";
-  const events = [];
-  const done = new Set;
-  let lastPrompt = "";
-  const base = (ts) => ({
-    anvc_capture: 0,
-    ts,
-    session_id: session,
-    agent: "codex",
-    cwd,
-    repo: null,
-    tool: null,
-    path: null,
-    bytes: null,
-    command: null,
-    prompt: null,
-    ok: null
-  });
-  const once = (id) => {
-    if (typeof id !== "string")
-      return true;
-    if (done.has(id))
-      return false;
-    done.add(id);
-    return true;
-  };
-  const prompt = (ts, text) => {
-    const t = text.trim();
-    if (!t || t === lastPrompt)
-      return;
-    lastPrompt = t;
-    events.push({ ...base(ts), event: "UserPromptSubmit", prompt: scrub(t).slice(0, 8192) });
-  };
-  const command = (ts, c) => {
-    const cmd = Array.isArray(c.command) ? c.command.map(String).join(" ") : typeof c.command === "string" ? c.command : "";
-    const output = [c.stdout, c.stderr].filter((x) => typeof x === "string" && x.length > 0).join(`
-`) || (typeof c.aggregated_output === "string" ? c.aggregated_output : "");
-    events.push({
-      ...base(ts),
-      event: "PostToolUse",
-      tool: "Bash",
-      cwd: typeof c.cwd === "string" ? pathOf(c.cwd) : cwd,
-      command: cmd ? scrub(cmd).slice(0, 512) : null,
-      ok: typeof c.exit_code === "number" ? c.exit_code === 0 : null,
-      output: output ? keepOutput(output, scrub) : null
-    });
-  };
-  const change = (ts, changes, ok) => {
-    const files = Array.isArray(changes) ? changes.map((c) => c?.path).filter((x) => typeof x === "string") : changes && typeof changes === "object" ? Object.keys(changes) : [];
-    for (const file of files) {
-      events.push({ ...base(ts), event: "PostToolUse", tool: "Edit", path: isAbsolute4(file) ? file : join12(cwd, file), ok });
-    }
-  };
-  for (const line of raw.split(`
-`)) {
-    if (!line.trim())
-      continue;
-    let row;
-    try {
-      row = JSON.parse(line);
-    } catch {
-      continue;
-    }
-    const p = row.payload ?? {};
-    const ts = row.timestamp;
-    if (row.type === "session_meta") {
-      session = typeof p.id === "string" ? p.id : session;
-      cwd = typeof p.cwd === "string" ? pathOf(p.cwd) : cwd;
-      continue;
-    }
-    if (row.type === "turn_context" && typeof p.cwd === "string") {
-      cwd = pathOf(p.cwd);
-      continue;
-    }
-    if (row.type !== "event_msg" || !ts)
-      continue;
-    if (p.type === "item_completed" && p.item && typeof p.item === "object") {
-      const item = p.item;
-      if (!once(item.id))
-        continue;
-      if (item.type === "UserMessage")
-        prompt(ts, textOf(item.content));
-      else if (item.type === "CommandExecution")
-        command(ts, item);
-      else if (item.type === "FileChange")
-        change(ts, item.changes, item.status !== "failed");
-    } else if (p.type === "user_message" && typeof p.message === "string") {
-      prompt(ts, p.message);
-    } else if (p.type === "exec_command_end") {
-      if (once(p.call_id))
-        command(ts, p);
-    } else if (p.type === "patch_apply_end") {
-      if (once(p.call_id))
-        change(ts, p.changes, typeof p.success === "boolean" ? p.success : true);
-    } else if (p.type === "task_complete") {
-      events.push({ ...base(ts), event: "Stop" });
-    }
-  }
-  return events;
-}
-function pathOf(where) {
-  if (!where.startsWith("file://"))
-    return where;
-  try {
-    return fileURLToPath(where);
-  } catch {
-    return where.slice(7);
-  }
-}
-function textOf(content) {
-  if (typeof content === "string")
-    return content;
-  if (!Array.isArray(content))
-    return "";
-  return content.map((c) => typeof c === "string" ? c : typeof c?.text === "string" ? c.text : "").filter(Boolean).join(`
-`);
-}
-function cursorSessions(repo, root = join12(cursorDir(), "projects")) {
-  const dir = join12(root, repo.replace(/^\/+/, "").replace(/[\\/:_]/g, "-"), "agent-transcripts");
-  const out = [];
-  let ids = [];
-  try {
-    ids = readdirSync3(dir);
-  } catch {
-    return out;
-  }
-  for (const id of ids) {
-    const path = join12(dir, id, `${id}.jsonl`);
-    try {
-      statSync4(path);
-      out.push({ session: id, path });
-    } catch {}
-  }
-  return out;
-}
-function cursorElsewhere(path, repo, text) {
-  const raw = readOr(path, text);
-  if (raw === null)
-    return false;
-  const seen = [...raw.matchAll(/"(?:path|file_path|target_file|targetDirectory|workingDirectory)"\s*:\s*"(\/[^"]+)"/g)].map((m) => m[1]);
-  return seen.length > 0 && !seen.some((p) => within(p, repo));
-}
-function readCursorSession(path, session, repo, scrub, text) {
-  const raw = readOr(path, text);
-  if (raw === null)
-    return [];
-  let end = Date.now();
-  try {
-    end = statSync4(path).mtimeMs;
-  } catch {}
-  const lines = raw.split(`
-`).filter((l) => l.trim());
-  const events = [];
-  lines.forEach((line, i) => {
-    let row;
-    try {
-      row = JSON.parse(line);
-    } catch {
-      return;
-    }
-    const ts = new Date(end - (lines.length - i) * 1000).toISOString();
-    const base = {
-      anvc_capture: 0,
-      ts,
-      session_id: session,
-      agent: "cursor",
-      cwd: repo,
-      repo: null,
-      tool: null,
-      path: null,
-      bytes: null,
-      command: null,
-      prompt: null,
-      ok: null
-    };
-    const content = Array.isArray(row.message?.content) ? row.message.content : [];
-    if (row.role === "user") {
-      const text = content.map((b) => typeof b.text === "string" ? b.text : "").join(`
-`);
-      const said = (/<user_query>\s*([\s\S]*?)\s*<\/user_query>/.exec(text)?.[1] ?? text).trim();
-      if (said)
-        events.push({ ...base, event: "UserPromptSubmit", prompt: scrub(said).slice(0, 8192) });
-      return;
-    }
-    for (const block of content) {
-      if (block.type !== "tool_use")
-        continue;
-      const call = toolCall(block.name, block.input ?? {});
-      if (!call.tool)
-        continue;
-      events.push({
-        ...base,
-        event: "PostToolUse",
-        tool: call.tool,
-        path: call.paths[0] ? isAbsolute4(call.paths[0]) ? call.paths[0] : join12(repo, call.paths[0]) : null,
-        command: call.command ? scrub(call.command).slice(0, 512) : null,
-        bytes: call.bytes
-      });
-    }
-  });
-  return events;
-}
-function missingCursorPrompts(transcript, session, repo, rows, scrub) {
-  const mine = rows.filter((r) => r.session_id === session);
-  if (mine.some((r) => r.event === "UserPromptSubmit"))
-    return [];
-  const prompts = readCursorSession(transcript, session, repo, scrub).filter((e) => e.event === "UserPromptSubmit");
-  const first = mine.map((r) => Date.parse(String(r.ts))).filter((t) => !Number.isNaN(t)).sort((a, b) => a - b)[0];
-  return prompts.map((e, i) => ({
-    ...e,
-    repo,
-    ts: first === undefined ? e.ts : new Date(first - (prompts.length - i)).toISOString()
-  }));
-}
-function repoOf(cwd, repo) {
-  if (!within(cwd, repo))
-    return null;
-  if (cwd === repo || !existsSync7(cwd))
-    return repo;
-  let nearest = nearestRepo.get(cwd);
-  if (nearest === undefined)
-    nearestRepo.set(cwd, nearest = repoRoot(cwd));
-  return nearest === null || isRepo(repo)(nearest) ? repo : null;
-}
-var nearestRepo = new Map;
-var within = (path, repo) => path === repo || path.startsWith(`${repo}/`) || isRepo(repo)(path) || inRepo(repo)(path) !== null;
-function backfill(repo, opts = {}) {
-  const dir = transcriptDir(repo, opts.root);
-  const scrub2 = opts.scrub ?? scrub;
-  let names = [];
-  try {
-    names = readdirSync3(dir).filter((n) => n.endsWith(".jsonl"));
-  } catch {}
-  const events = [];
-  let files = 0;
-  const take = (batch) => {
-    const mine = batch.filter((e) => !opts.since || e.ts >= opts.since).map((e) => ({ ...e, repo: repoOf(e.cwd, repo) })).filter((e) => e.repo);
-    if (!mine.length)
-      return;
-    files++;
-    events.push(...mine);
-  };
-  for (const full of codexSessions(opts.codexRoot)) {
-    const where = codexMeta(full).cwd;
-    if (where && repoOf(where, repo))
-      take(readCodexSession(full, scrub2));
-  }
-  for (const { session, path } of cursorSessions(repo, opts.cursorRoot)) {
-    if (!cursorElsewhere(path, repo))
-      take(readCursorSession(path, session, repo, scrub2));
-  }
-  const seen = new Set;
-  for (const name of names)
-    take(readTranscript(join12(dir, name), scrub2, seen));
-  const read = new Set(events.map((e) => e.session_id));
-  for (const kept of keptSessions(repo, opts.keptRoot)) {
-    if (read.has(kept.session))
-      continue;
-    const text = readKept(kept.path);
-    if (!text)
-      continue;
-    if (kept.agent === "cursor" && cursorElsewhere(kept.path, repo, text))
-      continue;
-    take(kept.agent === "codex" ? readCodexSession(kept.path, scrub2, text) : kept.agent === "cursor" ? readCursorSession(kept.path, kept.session, repo, scrub2, text) : readTranscript(kept.path, scrub2, seen, text).map((e) => ({ ...e, agent: kept.agent })));
-  }
-  events.sort((a, b) => a.ts.localeCompare(b.ts));
-  return {
-    events,
-    sessions: new Set(events.map((e) => e.session_id).filter(Boolean)).size,
-    files,
-    from: events[0]?.ts ?? null,
-    to: events.at(-1)?.ts ?? null
-  };
-}
-
-// protocol/autosave.ts
-import { mkdirSync as mkdirSync9, writeFileSync as writeFileSync8 } from "fs";
-import { join as join13 } from "path";
-var QUIET_MS = 30 * 60000;
-var DAYS = 3;
-var doneFile = (repo) => join13(stateRoot(), `autosaved-${repoKey(repo)}.json`);
-function autosave(repo, opts = {}) {
-  const now = Date.now();
-  const rows = captureRows(repo, undefined, lastDays(DAYS, now)).filter((row) => row.anvc_capture === 0 && row.session_id);
-  const done = readJson(doneFile(repo), {});
-  const ready = [...Map.groupBy(rows, (row) => row.session_id)].map(([session, list]) => ({ session, list, last: list.reduce((m, e) => e.ts > m ? e.ts : m, "") })).filter(({ session, last }) => {
-    if (done[session] && done[session] >= last)
-      return false;
-    if (opts.session)
-      return session === opts.session;
-    return session !== opts.except && now - Date.parse(last) >= QUIET_MS;
-  });
-  if (!ready.length)
-    return [];
-  const lastRecorded = new Map;
-  for (const [, r] of readRecords(repo)) {
-    if (typeof r.intent.goal !== "string")
-      continue;
-    const at = lastRecorded.get(r.session.run_id);
-    if (!at || r.ts > at)
-      lastRecorded.set(r.session.run_id, r.ts);
-  }
-  const saved = [];
-  for (const { session, list, last } of ready) {
-    const after = lastRecorded.get(session);
-    const { ids, failed } = ingest(repo, after ? list.filter((e) => e.ts > after) : list, { fresh: true });
-    if (ids.length)
-      logActivity({ kind: "autosaved", repo, session, records: ids });
-    saved.push(...ids);
-    if (!failed.length) {
-      done[session] = last;
-      continue;
-    }
-    logActivity({
-      kind: "autosaved",
-      repo,
-      session,
-      outcome: "failed",
-      records: failed.map((f) => f.slice(0, f.indexOf(": "))),
-      titles: failed.map((f) => f.slice(f.indexOf(": ") + 2))
-    });
-  }
-  const cutoff = new Date(now - (DAYS + 1) * 86400000).toISOString();
-  for (const [session, ts] of Object.entries(done))
-    if (ts < cutoff)
-      delete done[session];
-  try {
-    mkdirSync9(stateRoot(), { recursive: true });
-    writeFileSync8(doneFile(repo), JSON.stringify(done));
-  } catch {}
-  return saved;
-}
-
-// protocol/absorb.ts
-import { spawn as spawn2, spawnSync as spawnSync3 } from "child_process";
-import { existsSync as existsSync10, mkdtempSync as mkdtempSync2, readFileSync as readFileSync10, rmSync as rmSync6, statSync as statSync8, writeFileSync as writeFileSync11 } from "fs";
-import { tmpdir as tmpdir2 } from "os";
-import { basename as basename5, join as join17 } from "path";
-
-// protocol/goals.ts
-import { existsSync as existsSync9, mkdirSync as mkdirSync12, rmSync as rmSync5, writeFileSync as writeFileSync10 } from "fs";
-import { dirname as dirname8 } from "path";
+// protocol/runs.ts
+import { existsSync as existsSync5, statSync as statSync4 } from "fs";
+import { isAbsolute as isAbsolute3, resolve as resolve4 } from "path";
 
 // protocol/results.ts
-import { createHash as createHash5 } from "crypto";
-import { closeSync as closeSync4, lstatSync, mkdirSync as mkdirSync11, openSync as openSync4, readdirSync as readdirSync4, readFileSync as readFileSync8, readSync as readSync4, rmSync as rmSync4, statSync as statSync6, writeFileSync as writeFileSync9 } from "fs";
-import { dirname as dirname7, join as join15, resolve as resolve4 } from "path";
+import { createHash as createHash3 } from "crypto";
+import { closeSync as closeSync3, lstatSync, mkdirSync as mkdirSync8, openSync as openSync3, readdirSync as readdirSync2, readFileSync as readFileSync5, readSync as readSync3, rmSync as rmSync3, statSync as statSync3, writeFileSync as writeFileSync6 } from "fs";
+import { dirname as dirname7, join as join10, resolve as resolve3 } from "path";
 
 // protocol/retire.ts
 function headAnchor(repo) {
   const head = gitOrNull(repo, ["rev-parse", "--verify", "--quiet", "HEAD"]) ?? "";
   return OID.test(head) ? { kind: "commit", oid: head } : { kind: "blob", oid: "0".repeat(40) };
 }
-function verify2(db, repo, target, reason, by) {
+function verify(db, repo, target, reason, by) {
   if (reason === "replaced") {
     if (!by)
       return { ok: false, checked: "No newer record was named. Pass `by` with its id." };
@@ -3793,7 +2774,7 @@ function agentRetire(db, repo, args) {
   const waiting = retirements(db).pending.find((p) => p.target === target.id);
   if (waiting)
     throw new Error(`A retirement of ${args.target} is already waiting for the person (proposal ${waiting.id}).`);
-  const { ok, checked } = verify2(db, repo, target, reason, args.by);
+  const { ok, checked } = verify(db, repo, target, reason, args.by);
   const state = mode === "auto" && ok ? "retired" : "proposed";
   const written = write2(repo, target, state, reason, args.evidence, { kind: "agent", session: args.session, agent: args.agent }, args.by);
   return { state, checked, ...written };
@@ -3817,126 +2798,10 @@ function personDecide(db, repo, target, decision, note, reason) {
   return { state, checked: "Decided by the person.", ...written };
 }
 
-// protocol/runs.ts
-import { existsSync as existsSync8, statSync as statSync5 } from "fs";
-import { isAbsolute as isAbsolute5, resolve as resolve3 } from "path";
-var OUTPUT_FLAGS = /^(-o|--out|--output|--outfile|--out-file|--output-file|--out-dir|--outdir|--output-dir|--output_dir|--save|--save-to|--save-dir|--save_dir|--dest|--results|--results-dir|--log-dir|--logdir|--run-dir|--checkpoint-dir)$/;
-function words(command) {
-  return command.match(/"(?:\\.|[^"])*"|'[^']*'|&&|\|\||[;|<>]|[^\s;|<>]+/g)?.map((w) => w.replace(/^(["'])(.*)\1$/, "$2")) ?? [];
-}
-function flags(command) {
-  const out = {};
-  const w = words(command);
-  for (let i = 0;i < w.length && Object.keys(out).length < 30; i++) {
-    const m = /^--([A-Za-z][\w.-]*)(?:=(.+))?$/.exec(w[i]);
-    if (!m)
-      continue;
-    const next = w[i + 1];
-    if (m[2] !== undefined)
-      out[m[1]] = m[2].slice(0, 200);
-    else if (next !== undefined && !next.startsWith("-") && !/^(&&|\|\||[;|<>])$/.test(next)) {
-      out[m[1]] = next.slice(0, 200);
-      i++;
-    } else
-      out[m[1]] = "true";
-  }
-  return out;
-}
-var READERS = new Set(["cat", "bat", "head", "tail", "less", "more", "grep", "egrep", "fgrep", "rg", "ag", "ack", "ls", "tree", "find", "fd", "wc", "sed", "echo", "printf", "sort", "uniq", "cut", "tr", "column", "diff", "cmp", "jq", "yq", "file", "stat", "du", "df", "git", "gh", "curl", "wget"]);
-var KEYWORDS = new Set(["until", "while", "do", "then", "else", "elif", "if", "!", "{", "("]);
-var QUIET = new Set(["cd", "pushd", "popd", "sleep", "done", "fi", "for", "[", "[[", "test", "true", "false", "export", "set", "mkdir", "rm", "cp", "mv", "touch", "pgrep", "pkill", "kill", "wait", "exit", "}", ")"]);
-var PREFIXES = new Set(["sudo", "time", "env", "nice", "command", "exec", "xargs"]);
-function onlyReads(command) {
-  let read = false;
-  for (const line of command.split(`
-`)) {
-    let start = true;
-    for (const w of words(line)) {
-      if (/^(&&|\|\||[;|&])$/.test(w)) {
-        start = true;
-        continue;
-      }
-      if (!start || /^\w+=/.test(w) || PREFIXES.has(w) || KEYWORDS.has(w))
-        continue;
-      start = false;
-      const program = w.split("/").at(-1);
-      if (QUIET.has(program))
-        continue;
-      if (!READERS.has(program))
-        return false;
-      read = true;
-    }
-  }
-  return read;
-}
-function mainStep(command) {
-  const steps = command.split(/\s*(?:&&|\|\||;|\||\n)\s*/).map((s) => s.trim()).filter(Boolean);
-  for (const step of steps) {
-    const first = words(step).find((w) => !/^\w+=/.test(w) && !PREFIXES.has(w) && !KEYWORDS.has(w));
-    const program = first?.split("/").at(-1);
-    if (program && !READERS.has(program) && !QUIET.has(program))
-      return step;
-  }
-  return command;
-}
-function runFiles(command, cwd, repo) {
-  const moved = /(^|[;&|]\s*)cd\s/.test(command);
-  const toRepo = inRepo(repo);
-  const place = (p) => {
-    if (!p || p.startsWith("-") || /[*?$`]/.test(p) || /^\d+$/.test(p))
-      return null;
-    if (moved && !isAbsolute5(p))
-      return null;
-    return toRepo(resolve3(cwd, p));
-  };
-  const outputs = new Set;
-  const inputs = new Set;
-  for (const { path, kind } of shellPaths(command)) {
-    const rel = place(path);
-    if (rel)
-      (kind === "write" ? outputs : inputs).add(rel);
-  }
-  const w = words(command);
-  for (let i = 0;i < w.length; i++) {
-    const [flag, inline] = w[i].split(/=(.*)/s, 2);
-    if (OUTPUT_FLAGS.test(flag)) {
-      const rel = place(inline ?? w[i + 1] ?? "");
-      if (rel)
-        outputs.add(rel);
-      if (inline === undefined)
-        i++;
-      continue;
-    }
-    const value = inline ?? w[i];
-    if (!/[./]/.test(value))
-      continue;
-    const rel = place(value);
-    if (rel && !outputs.has(rel))
-      inputs.add(rel);
-  }
-  const print = (rel, folders) => {
-    const abs = resolve3(repo, rel);
-    if (rel === "." || rel.startsWith(".git") || !existsSync8(abs))
-      return null;
-    try {
-      if (!folders && statSync5(abs).isDirectory())
-        return null;
-    } catch {
-      return null;
-    }
-    const f = fingerprint(abs);
-    return f ? { path: rel, hash: f.hash, bytes: f.bytes } : null;
-  };
-  const out = [...outputs].slice(0, 20).map((p) => print(p, true)).filter((f) => f !== null);
-  const written = new Set(out.map((f) => f.path));
-  const inp = [...inputs].filter((p) => !written.has(p)).slice(0, 20).map((p) => print(p, false)).filter((f) => f !== null);
-  return { outputs: out, inputs: inp };
-}
-
 // protocol/runlog.ts
-import { appendFileSync as appendFileSync3, mkdirSync as mkdirSync10 } from "fs";
-import { dirname as dirname6, join as join14 } from "path";
-var runsDir = (repo) => join14(captureRoot(), "runs", repoKey(repo));
+import { appendFileSync as appendFileSync2, mkdirSync as mkdirSync7 } from "fs";
+import { dirname as dirname6, join as join9 } from "path";
+var runsDir = (repo) => join9(captureRoot(), "runs", repoKey(repo));
 var runsFiles = (repo) => jsonl(runsDir(repo));
 
 class Keep {
@@ -4026,9 +2891,9 @@ async function trackRun(command, cwd = process.cwd()) {
       files = found.outputs.map((f) => f.path);
     } catch {}
   }
-  const file = join14(runsDir(repo), `${row.ts.toString().slice(0, 10)}.jsonl`);
-  mkdirSync10(dirname6(file), { recursive: true, mode: 448 });
-  appendFileSync3(file, `${JSON.stringify(row)}
+  const file = join9(runsDir(repo), `${row.ts.toString().slice(0, 10)}.jsonl`);
+  mkdirSync7(dirname6(file), { recursive: true, mode: 448 });
+  appendFileSync2(file, `${JSON.stringify(row)}
 `, { mode: 384 });
   return { code, logged: true, files };
 }
@@ -4039,7 +2904,7 @@ var DATA_MODES = {
   results: { label: "On", what: "Your agent records the numbers you rely on, with where they came from, and ANVC checks them whenever they're shown." }
 };
 var DEFAULT_DATA_MODE = "results";
-var everywhereFile = () => join15(stateHome(), "data.json");
+var everywhereFile = () => join10(stateHome(), "data.json");
 var projectFile = (repo) => marker(repo, "data.json");
 var readMode = (file) => {
   const mode = file ? readJson(file, null)?.mode : undefined;
@@ -4058,7 +2923,7 @@ var everywhereDataMode = () => readMode(everywhereFile()) ?? DEFAULT_DATA_MODE;
 function clearProjectDataMode(repo) {
   const file = projectFile(repo);
   if (file)
-    rmSync4(file, { force: true });
+    rmSync3(file, { force: true });
 }
 function setDataMode(repo, mode) {
   if (!Object.hasOwn(DATA_MODES, mode))
@@ -4071,15 +2936,15 @@ function setDataMode(repo, mode) {
 var FULL_HASH_BYTES = 64 * 1024 * 1024;
 var SAMPLE_BYTES = 1024 * 1024;
 var MAX_FOLDER_FILES = 5000;
-function fingerprint(path) {
+function fingerprint(path, every = false) {
   let stat;
   try {
-    stat = statSync6(path);
+    stat = statSync3(path);
   } catch {
     return null;
   }
   if (stat.isDirectory())
-    return folderPrint(path);
+    return folderPrint(path, every);
   const cache = prints();
   const known = cache.get(path);
   if (known && known.bytes === stat.size && known.mtime === stat.mtimeMs)
@@ -4091,23 +2956,23 @@ function fingerprint(path) {
 }
 function hashFile(path, size) {
   if (size <= FULL_HASH_BYTES) {
-    return { hash: `sha256:${createHash5("sha256").update(readFileSync8(path)).digest("hex")}`, bytes: size };
+    return { hash: `sha256:${createHash3("sha256").update(readFileSync5(path)).digest("hex")}`, bytes: size };
   }
-  const h = createHash5("sha256").update(String(size));
-  const fd = openSync4(path, "r");
+  const h = createHash3("sha256").update(String(size));
+  const fd = openSync3(path, "r");
   try {
     for (const at of [0, Math.floor(size / 2), size - SAMPLE_BYTES]) {
       const buf = Buffer.alloc(SAMPLE_BYTES);
-      readSync4(fd, buf, 0, SAMPLE_BYTES, at);
+      readSync3(fd, buf, 0, SAMPLE_BYTES, at);
       h.update(buf);
     }
   } finally {
-    closeSync4(fd);
+    closeSync3(fd);
   }
   return { hash: `sampled:${h.digest("hex")}`, bytes: size };
 }
 var cached = null;
-var printsFile = () => join15(stateRoot(), "prints.json");
+var printsFile = () => join10(stateRoot(), "prints.json");
 function prints() {
   if (cached)
     return cached;
@@ -4123,28 +2988,27 @@ function savePrints() {
     return;
   const entries = [...cached.entries()].slice(-5000);
   try {
-    mkdirSync11(dirname7(printsFile()), { recursive: true });
-    writeFileSync9(printsFile(), JSON.stringify(Object.fromEntries(entries)));
+    mkdirSync8(dirname7(printsFile()), { recursive: true });
+    writeFileSync6(printsFile(), JSON.stringify(Object.fromEntries(entries)));
   } catch {}
 }
-function folderPrint(root) {
-  const h = createHash5("sha256");
-  let bytes = 0, files = 0;
+function folderFiles(root, every = false) {
+  const files = [];
   const base = samePath(root);
   const walk = (dir) => {
     let names = [];
     try {
-      names = readdirSync4(dir).sort();
+      names = readdirSync2(dir).sort();
     } catch {
       return;
     }
     for (const name of names) {
-      if (files >= MAX_FOLDER_FILES || name === ".git" || name === "node_modules")
+      if (files.length >= MAX_FOLDER_FILES || name === ".git" || name === "node_modules")
         continue;
-      const path = join15(dir, name);
+      const path = join10(dir, name);
       let stat;
       try {
-        stat = statSync6(path);
+        stat = statSync3(path);
       } catch {
         continue;
       }
@@ -4155,18 +3019,31 @@ function folderPrint(root) {
         continue;
       }
       if (stat.isDirectory()) {
-        walk(path);
+        if (every || !skipDir(name))
+          walk(path);
         continue;
       }
-      files++;
-      bytes += stat.size;
-      h.update(`${below(root, path)}\x00${stat.size}\x00`);
-      if (stat.size <= 256 * 1024)
-        h.update(readFileSync8(path));
+      if (!every && /\.py[co]$|^\.DS_Store$/.test(name))
+        continue;
+      files.push({ path, size: stat.size, mtime: stat.mtimeMs });
     }
   };
   walk(root);
-  return { hash: `${files >= MAX_FOLDER_FILES ? "folder-partial" : "folder"}:${h.digest("hex")}`, bytes };
+  return { files, partial: files.length >= MAX_FOLDER_FILES };
+}
+function folderPrint(root, every = false) {
+  const h = createHash3("sha256");
+  const { files, partial } = folderFiles(root, every);
+  for (const f of files) {
+    h.update(`${below(root, f.path)}\x00${f.size}\x00`);
+    if (f.size <= 256 * 1024)
+      h.update(readFileSync5(f.path));
+  }
+  const name = every ? "folder" : "files";
+  return { hash: `${partial ? `${name}-partial` : name}:${h.digest("hex")}`, bytes: files.reduce((n, f) => n + f.size, 0) };
+}
+function newerIn(root, since) {
+  return folderFiles(root).files.filter((f) => f.mtime > since).sort((a, b) => b.mtime - a.mtime).slice(0, 3).map((f) => below(root, f.path));
 }
 function parseJson(text) {
   try {
@@ -4177,7 +3054,7 @@ function parseJson(text) {
 }
 function readSmall(path, max) {
   try {
-    return statSync6(path).size > max ? null : readFileSync8(path, "utf8");
+    return statSync3(path).size > max ? null : readFileSync5(path, "utf8");
   } catch {
     return null;
   }
@@ -4225,6 +3102,31 @@ function rowsNamed(rows, name) {
     return rows.slice(1).filter((r) => r[0] === name);
   return rows.slice(1).filter((r) => pairs.every(([col, v]) => r[col] === v));
 }
+function cellAt(rows, key) {
+  for (let at = key.indexOf("/");at >= 0; at = key.indexOf("/", at + 1)) {
+    const col = rows[0]?.indexOf(key.slice(at + 1)) ?? -1;
+    const hits = col >= 0 ? rowsNamed(rows, key.slice(0, at)) : [];
+    if (hits.length === 1 && hits[0][col] !== undefined)
+      return hits[0][col];
+  }
+  return null;
+}
+function markdownTables(text) {
+  const tables = [];
+  let rows = [];
+  for (const line of [...text.split(/\r?\n/), ""]) {
+    if (!/^\s*\|.*\|\s*$/.test(line)) {
+      if (rows.length > 1)
+        tables.push(rows);
+      rows = [];
+      continue;
+    }
+    const cells = line.trim().slice(1, -1).split("|").map((c) => c.trim().replace(/^[*_`]+|[*_`]+$/g, ""));
+    if (!cells.every((c) => /^:?-+:?$/.test(c)))
+      rows.push(cells);
+  }
+  return tables;
+}
 function readValue(path, key) {
   const text = readSmall(path, 16 * 1024 * 1024);
   if (text === null)
@@ -4242,15 +3144,12 @@ function readValue(path, key) {
       return null;
     }
   }
-  if (/\.(csv|tsv)$/i.test(path) && key.includes("/")) {
-    const rows = table(path, text);
-    for (let at = key.indexOf("/");at >= 0; at = key.indexOf("/", at + 1)) {
-      const col = rows[0]?.indexOf(key.slice(at + 1)) ?? -1;
-      const hits = col >= 0 ? rowsNamed(rows, key.slice(0, at)) : [];
-      if (hits.length === 1 && hits[0][col] !== undefined)
-        return hits[0][col];
-    }
-    return null;
+  if (/\.(csv|tsv)$/i.test(path) && key.includes("/"))
+    return cellAt(table(path, text), key);
+  if (/\.(md|markdown)$/i.test(path) && key.includes("/")) {
+    const hits = markdownTables(text).map((rows) => cellAt(rows, key)).filter((v) => v !== null);
+    if (hits.length)
+      return hits.length === 1 ? hits[0] : null;
   }
   const line = text.split(/\r?\n/).find((l) => l.includes(key));
   const after = line ? line.slice(line.indexOf(key) + key.length) : "";
@@ -4299,7 +3198,7 @@ function appendKept(repo, body, goal, why, actor, tier) {
   return { id: record.id, ref };
 }
 var inside = (repo, path) => {
-  const rel = below(repo, resolve4(repo, path));
+  const rel = below(repo, resolve3(repo, path));
   if (!rel || !realInside(repo, rel))
     throw new Error(`${path} is not inside the repository`);
   return rel;
@@ -4316,10 +3215,10 @@ function recordResult(repo, given, actor) {
   let source;
   if (input.source?.path) {
     const path = inside(repo, input.source.path);
-    const print = fingerprint(join15(repo, path));
+    const print = fingerprint(join10(repo, path));
     if (!print)
       notes.push(`${path} isn't here, so ANVC couldn't fingerprint it or check the value.`);
-    const read = print && input.source.key ? readValue(join15(repo, path), input.source.key) : null;
+    const read = print && input.source.key ? readValue(join10(repo, path), input.source.key) : null;
     if (input.source.key && print) {
       if (read === null)
         notes.push(`Couldn't find ${input.source.key} in ${path}.`);
@@ -4347,7 +3246,7 @@ function recordResult(repo, given, actor) {
   }
   const depends = (input.depends ?? []).map((p) => {
     const path = inside(repo, p);
-    const print = fingerprint(join15(repo, path));
+    const print = fingerprint(join10(repo, path));
     if (!print)
       notes.push(`${path} isn't here, so it can't be checked later.`);
     return { path, ...print ? { hash: print.hash, bytes: print.bytes } : {} };
@@ -4478,20 +3377,25 @@ function listResults(repo) {
   }
   return [...roots.values()].sort((a, b) => b.ts.localeCompare(a.ts));
 }
-var fingerprintInside = (repo, path) => {
+var fingerprintInside = (repo, path, every = false) => {
   const real = realInside(repo, path);
-  return real ? fingerprint(real) : null;
+  return real ? fingerprint(real, every) : null;
 };
 var stateOf = (repo, path, hash) => {
   if (!hash)
     return "unknown";
-  const now = fingerprintInside(repo, path);
+  const now = fingerprintInside(repo, path, hash.startsWith("folder"));
   return !now ? "missing" : now.hash === hash ? "same" : "changed";
 };
 function checkResult(repo, view, all) {
   const real = view.source && realInside(repo, view.source.path);
   const source = view.source ? { state: stateOf(repo, view.source.path, view.source.hash), now: view.source.key && real ? readValue(real, view.source.key) : null } : null;
-  const depends = view.depends.map((d) => ({ path: d.path, state: stateOf(repo, d.path, d.hash) }));
+  const depends = view.depends.map((d) => {
+    const state = stateOf(repo, d.path, d.hash);
+    const real = state === "changed" && realInside(repo, d.path);
+    const newer = real && statSync3(real).isDirectory() ? newerIn(real, Date.parse(view.ts)) : [];
+    return { path: d.path, state, ...newer.length ? { newer } : {} };
+  });
   const everyone = all ?? listResults(repo);
   const derived = view.derived_from.map((id) => {
     const from = everyone.find((r) => r.id === id);
@@ -4518,7 +3422,7 @@ function describe(view, check, all = []) {
   if (view.command)
     lines.push(`  made by: ${view.command}${Object.keys(view.settings).length ? ` \xB7 ${Object.entries(view.settings).map(([k, v]) => `${k}=${v}`).join(", ")}` : ""}`);
   if (check.depends.length) {
-    lines.push(`  depends on: ${check.depends.map((d) => `${d.path} ${d.state === "same" ? "unchanged" : d.state === "changed" ? "CHANGED" : d.state === "missing" ? "missing" : "?"}`).join(", ")}`);
+    lines.push(`  depends on: ${check.depends.map((d) => `${d.path} ${d.state === "same" ? "unchanged" : d.state === "changed" ? `CHANGED${d.newer ? ` (newer: ${d.newer.join(", ")})` : ""}` : d.state === "missing" ? "missing" : "?"}`).join(", ")}`);
   }
   if (check.derived.length)
     lines.push(`  computed from: ${check.derived.map((d) => `${d.name} (${d.status})`).join(", ")}`);
@@ -4557,6 +3461,30 @@ function logRows(repo) {
 function producer(repo, path) {
   return logRows(repo).filter((r) => r.outputs?.some((o) => o.path === path)).at(-1) ?? null;
 }
+function tableValues(rows) {
+  const out = [];
+  const header = rows[0] ?? [];
+  const data = rows.slice(1, 5000);
+  const lead = (r, n) => r.slice(0, n).join("\x00");
+  const counts = [];
+  for (const row of data) {
+    let name = null;
+    for (let n = 1;n <= header.length && name === null; n++) {
+      const c = counts[n] ??= Map.groupBy(data, (r) => lead(r, n));
+      if (c.get(lead(row, n)).length !== 1)
+        continue;
+      if (n > 1 && [...header.slice(0, n), ...row.slice(0, n)].some((v) => /[,=]/.test(v)))
+        break;
+      name = n === 1 ? row[0] : header.slice(0, n).map((h, i) => `${h}=${row[i]}`).join(",");
+    }
+    if (name !== null)
+      row.forEach((cell, i) => {
+        if (i > 0 && /^-?\d/.test(cell))
+          out.push({ key: `${name}/${header[i] ?? i}`, value: cell });
+      });
+  }
+  return out;
+}
 function values(path) {
   const text = readSmall(path, 4 * 1024 * 1024);
   if (text === null)
@@ -4588,29 +3516,12 @@ function values(path) {
     const lines = Map.groupBy(out, (v) => field(v.key));
     return out.filter((v) => lines.get(field(v.key)).length <= 100);
   }
-  if (/\.(csv|tsv)$/i.test(path)) {
-    const rows = table(path, text);
-    const header = rows[0] ?? [];
-    const data = rows.slice(1, 5000);
-    const lead = (r, n) => r.slice(0, n).join("\x00");
-    const counts = [];
-    for (const row of data) {
-      let name = null;
-      for (let n = 1;n <= header.length && name === null; n++) {
-        const c = counts[n] ??= Map.groupBy(data, (r) => lead(r, n));
-        if (c.get(lead(row, n)).length !== 1)
-          continue;
-        if (n > 1 && [...header.slice(0, n), ...row.slice(0, n)].some((v) => /[,=]/.test(v)))
-          break;
-        name = n === 1 ? row[0] : header.slice(0, n).map((h, i) => `${h}=${row[i]}`).join(",");
-      }
-      if (name !== null)
-        row.forEach((cell, i) => {
-          if (i > 0 && /^-?\d/.test(cell))
-            out.push({ key: `${name}/${header[i] ?? i}`, value: cell });
-        });
-    }
-    return out;
+  if (/\.(csv|tsv)$/i.test(path))
+    return tableValues(table(path, text));
+  if (/\.(md|markdown)$/i.test(path)) {
+    const all = markdownTables(text).flatMap(tableValues);
+    const count = Map.groupBy(all, (v) => v.key);
+    return all.filter((v) => count.get(v.key).length === 1);
   }
   if (/\.(txt|log|out|yaml|yml|tex)$/i.test(path)) {
     for (const line of text.split(/\r?\n/).slice(0, 20000)) {
@@ -4643,14 +3554,14 @@ function dataFiles(repo) {
   const walk = (dir, depth) => {
     let entries;
     try {
-      entries = readdirSync4(dir, { withFileTypes: true });
+      entries = readdirSync2(dir, { withFileTypes: true });
     } catch {
       return;
     }
     for (const e of entries) {
       if (out.length >= 2000 || bytes > 96 * 1024 * 1024)
         return;
-      const abs = join15(dir, e.name);
+      const abs = join10(dir, e.name);
       if (e.isDirectory()) {
         if (depth < 8 && !skipDir(e.name))
           walk(abs, depth + 1);
@@ -4660,7 +3571,7 @@ function dataFiles(repo) {
         continue;
       let st;
       try {
-        st = statSync6(abs);
+        st = statSync3(abs);
       } catch {
         continue;
       }
@@ -4788,7 +3699,1183 @@ function whence(repo, text, limit = 8, scope = {}, context = {}) {
   return { results: found, files, outputs, reads, elsewhere };
 }
 
+// protocol/shell-paths.ts
+function literal(token) {
+  if (!token)
+    return null;
+  const value = token.replace(/^['"]|['"]$/g, "");
+  if (!value || /[$*?`]/.test(value))
+    return null;
+  if (value === "/dev/null" || value.startsWith("-"))
+    return null;
+  if (/[=(){}!,;]|^\d+$/.test(value))
+    return null;
+  if (!SEPARATOR.test(value) && !/^[\w.-]+\.[a-z0-9]{1,8}$/i.test(value))
+    return null;
+  if (value.length > 4096)
+    return null;
+  return value;
+}
+var SEPARATOR = process.platform === "win32" ? /\/|\\(?!$)/ : /\//;
+var READ_COMMANDS = new Set(["cat", "head", "tail", "less", "grep", "rg", "wc", "diff", "md5sum", "sha256sum", "jq", "sort", "uniq"]);
+var WRITE_COMMANDS = new Set(["touch", "mkdir", "rm", "cp", "mv", "tee", "shred"]);
+function shellPaths(command) {
+  const found = new Map;
+  const add = (path, kind) => {
+    if (!path)
+      return;
+    if (kind === "write" || !found.has(path))
+      found.set(path, kind);
+  };
+  for (const match of command.matchAll(/(?<![0-9&])>>?\s*(['"]?[^\s;|&()'"]+['"]?)/g))
+    add(literal(match[1]), "write");
+  for (const match of command.matchAll(/(?<!<)<(?!<)\s*(['"]?[^\s;|&()'"]+['"]?)/g))
+    add(literal(match[1]), "read");
+  for (const match of command.matchAll(/\bsed\s+(?:-[a-zA-Z]*i[a-zA-Z]*\S*\s+)(?:(?:-e\s+)?(['"]).*?\1\s+)?(\S+)/g))
+    add(literal(match[2]), "write");
+  for (const match of command.matchAll(/open\(\s*(['"])([^'"]+)\1\s*(?:,\s*(['"])([rwa])[^'"]*\3)?/g)) {
+    const mode = match[4] ?? "r";
+    add(literal(match[2]), mode === "r" ? "read" : "write");
+  }
+  for (const segment of command.split(/[;|]|&&|\|\||\n/)) {
+    const bare = segment.replace(/<<-?\s*(['"]?)\w+\1/g, " ").replace(/[0-9&]?>>?\s*[^\s;|&()]*/g, " ").replace(/<\s*\([^)]*\)/g, " ").replace(/(?<!<)<(?!<)\s*[^\s;|&()]*/g, " ");
+    const tokens = bare.trim().split(/\s+/);
+    let head = tokens[0];
+    let rest = tokens.slice(1);
+    while (head && ["sudo", "env", "time", "nohup"].includes(head)) {
+      head = rest[0];
+      rest = rest.slice(1);
+    }
+    if (!head)
+      continue;
+    const name = head.split("/").pop();
+    const operands = rest.filter((t) => !t.startsWith("-"));
+    const patternFirst = name === "grep" || name === "rg";
+    if (READ_COMMANDS.has(name)) {
+      for (const operand of patternFirst ? operands.slice(1) : operands)
+        add(literal(operand), "read");
+    } else if (WRITE_COMMANDS.has(name)) {
+      if ((name === "cp" || name === "mv") && operands.length >= 2) {
+        add(literal(operands[0]), "read");
+        add(literal(operands.at(-1)), "write");
+      } else
+        for (const operand of operands)
+          add(literal(operand), "write");
+    }
+  }
+  return [...found].map(([path, kind]) => ({ path, kind }));
+}
+
+// protocol/runs.ts
+var OUTPUT_FLAGS = /^(-o|--out|--output|--outfile|--out-file|--output-file|--out-dir|--outdir|--output-dir|--output_dir|--save|--save-to|--save-dir|--save_dir|--dest|--results|--results-dir|--log-dir|--logdir|--run-dir|--checkpoint-dir)$/;
+function words(command) {
+  return command.match(/"(?:\\.|[^"])*"|'[^']*'|&&|\|\||[;|<>]|[^\s;|<>]+/g)?.map((w) => w.replace(/^(["'])(.*)\1$/, "$2")) ?? [];
+}
+function flags(command) {
+  const out = {};
+  const w = words(command);
+  for (let i = 0;i < w.length && Object.keys(out).length < 30; i++) {
+    const m = /^--([A-Za-z][\w.-]*)(?:=(.+))?$/.exec(w[i]);
+    if (!m)
+      continue;
+    const next = w[i + 1];
+    if (m[2] !== undefined)
+      out[m[1]] = m[2].slice(0, 200);
+    else if (next !== undefined && !next.startsWith("-") && !/^(&&|\|\||[;|<>])$/.test(next)) {
+      out[m[1]] = next.slice(0, 200);
+      i++;
+    } else
+      out[m[1]] = "true";
+  }
+  return out;
+}
+var READERS = new Set(["cat", "bat", "head", "tail", "less", "more", "grep", "egrep", "fgrep", "rg", "ugrep", "ug", "ag", "ack", "ls", "tree", "find", "fd", "wc", "sed", "echo", "printf", "sort", "uniq", "cut", "tr", "column", "diff", "cmp", "jq", "yq", "file", "stat", "du", "df", "git", "gh", "curl", "wget"]);
+var KEYWORDS = new Set(["until", "while", "do", "then", "else", "elif", "if", "!", "{", "("]);
+var QUIET = new Set(["cd", "pushd", "popd", "sleep", "done", "fi", "for", "[", "[[", "test", "true", "false", "export", "set", "mkdir", "rm", "cp", "mv", "touch", "pgrep", "pkill", "kill", "wait", "exit", "}", ")"]);
+var PREFIXES = new Set(["sudo", "time", "env", "nice", "command", "exec", "xargs"]);
+function onlyReads(command, readers = READERS) {
+  let read = false;
+  for (const line of command.split(`
+`)) {
+    let start = true;
+    for (const w of words(line)) {
+      if (/^(&&|\|\||[;|&])$/.test(w)) {
+        start = true;
+        continue;
+      }
+      if (!start || /^\w+=/.test(w) || PREFIXES.has(w) || KEYWORDS.has(w))
+        continue;
+      start = false;
+      const program = w.split("/").at(-1);
+      if (QUIET.has(program))
+        continue;
+      if (!readers.has(program))
+        return false;
+      read = true;
+    }
+  }
+  return read;
+}
+var LOOKUPS = new Set(["cat", "bat", "head", "tail", "less", "grep", "egrep", "fgrep", "rg", "ugrep", "ug", "ag", "ack", "ls", "tree", "find", "fd", "wc", "stat", "file", "which", "type", "du", "jq", "yq", "sort", "uniq", "cut", "column"]);
+var onlyLooks = (command) => onlyReads(command, LOOKUPS);
+function mainStep(command) {
+  const steps = command.split(/\s*(?:&&|\|\||;|\||\n)\s*/).map((s) => s.trim()).filter(Boolean);
+  for (const step of steps) {
+    const first = words(step).find((w) => !/^\w+=/.test(w) && !PREFIXES.has(w) && !KEYWORDS.has(w));
+    const program = first?.split("/").at(-1);
+    if (program && !READERS.has(program) && !QUIET.has(program))
+      return step;
+  }
+  return command;
+}
+function runFiles(command, cwd, repo) {
+  const moved = /(^|[;&|]\s*)cd\s/.test(command);
+  const toRepo = inRepo(repo);
+  const place = (p) => {
+    if (!p || p.startsWith("-") || /[*?$`]/.test(p) || /^\d+$/.test(p))
+      return null;
+    if (moved && !isAbsolute3(p))
+      return null;
+    return toRepo(resolve4(cwd, p));
+  };
+  const outputs = new Set;
+  const inputs = new Set;
+  for (const { path, kind } of shellPaths(command)) {
+    const rel = place(path);
+    if (rel)
+      (kind === "write" ? outputs : inputs).add(rel);
+  }
+  const w = words(command);
+  for (let i = 0;i < w.length; i++) {
+    const [flag, inline] = w[i].split(/=(.*)/s, 2);
+    if (OUTPUT_FLAGS.test(flag)) {
+      const rel = place(inline ?? w[i + 1] ?? "");
+      if (rel)
+        outputs.add(rel);
+      if (inline === undefined)
+        i++;
+      continue;
+    }
+    const value = inline ?? w[i];
+    if (!/[./]/.test(value))
+      continue;
+    const rel = place(value);
+    if (rel && !outputs.has(rel))
+      inputs.add(rel);
+  }
+  const print = (rel, folders) => {
+    const abs = resolve4(repo, rel);
+    if (rel === "." || rel.startsWith(".git") || !existsSync5(abs))
+      return null;
+    try {
+      if (!folders && statSync4(abs).isDirectory())
+        return null;
+    } catch {
+      return null;
+    }
+    const f = fingerprint(abs);
+    return f ? { path: rel, hash: f.hash, bytes: f.bytes } : null;
+  };
+  const out = [...outputs].slice(0, 20).map((p) => print(p, true)).filter((f) => f !== null);
+  const written = new Set(out.map((f) => f.path));
+  const inp = [...inputs].filter((p) => !written.has(p)).slice(0, 20).map((p) => print(p, false)).filter((f) => f !== null);
+  return { outputs: out, inputs: inp };
+}
+
+// protocol/recheck.ts
+import { createHash as createHash4 } from "crypto";
+import { mkdirSync as mkdirSync9, writeFileSync as writeFileSync7 } from "fs";
+import { join as join11 } from "path";
+var COMMANDS = [
+  "bun test",
+  "bun run typecheck",
+  "npm test",
+  "pnpm test",
+  "yarn test",
+  "pytest",
+  "python -m pytest",
+  "python3 -m pytest",
+  "python -m unittest",
+  "python3 -m unittest",
+  "cargo test",
+  "go test",
+  "make test"
+];
+var ARG = /^(?:-[qvx]|(?![-/])(?![A-Za-z]:)(?!(?:.*\/)?\.\.(?:\/|$))[\w./:-]{1,80})$/;
+function argvOf(command) {
+  const text = command.trim();
+  if (!/^[\x21-\x7e]+( [\x21-\x7e]+)*$/.test(text))
+    return null;
+  const head = COMMANDS.find((c) => text === c || text.startsWith(`${c} `));
+  if (!head)
+    return null;
+  const args = text.slice(head.length).split(" ").filter(Boolean);
+  return args.length <= 3 && args.every((a) => ARG.test(a)) ? [...head.split(" "), ...args] : null;
+}
+var runnable = (command) => argvOf(command) !== null;
+var RECHECK_TIMEOUT_MS = 2000;
+function verify2(repo, command) {
+  const argv = argvOf(command);
+  if (!argv)
+    return null;
+  try {
+    const proc = Bun.spawnSync(argv, { cwd: repo, stdout: "pipe", stderr: "pipe", timeout: RECHECK_TIMEOUT_MS });
+    if (proc.exitCode === null || proc.exitCode === 9009)
+      return null;
+    return proc.exitCode === 0 ? "checked just now: the check that failed back then passes now, so this may no longer be true; read the current code before following it" : "checked just now: still fails, so this still holds";
+  } catch {
+    return null;
+  }
+}
+var cacheFile = () => join11(stateRoot(), "rechecks.json");
+var readCache = () => readJson(cacheFile(), {});
+function keyFor(repo, command) {
+  const state = gitOrNull(repo, ["rev-parse", "HEAD"]) ?? "";
+  const dirty = gitOrNull(repo, ["diff", "HEAD"]) ?? "";
+  return createHash4("sha256").update(`${repo}\x00${command}\x00${state}\x00${dirty}`).digest("hex").slice(0, 24);
+}
+function cachedCheck(repo, command) {
+  if (!runnable(command))
+    return null;
+  const hit = readCache()[keyFor(repo, command)];
+  return hit ? hit.result : undefined;
+}
+function verifyCached(repo, command) {
+  if (!runnable(command))
+    return null;
+  const key = keyFor(repo, command);
+  const cache = readCache();
+  if (key in cache)
+    return cache[key].result;
+  const result = verify2(repo, command);
+  cache[key] = { result, ts: new Date().toISOString() };
+  const entries = Object.entries(cache).sort((a, b) => b[1].ts.localeCompare(a[1].ts)).slice(0, 200);
+  try {
+    mkdirSync9(join11(cacheFile(), ".."), { recursive: true });
+    writeFileSync7(cacheFile(), JSON.stringify(Object.fromEntries(entries)));
+  } catch {}
+  return result;
+}
+
+// protocol/evidence.ts
+var EDITS = new Set(["Edit", "Write", "MultiEdit", "NotebookEdit"]);
+function editedFiles(rows, root) {
+  const toRepo = inRepo(root);
+  return [...new Set(rows.filter((r) => r.tool && EDITS.has(r.tool)).map((r) => toRepo(r.path)).filter((p) => p !== null))];
+}
+function sessionRows(root, session, since) {
+  return captureRows(root, undefined, lastDays(2), [JSON.stringify(session)]).filter((row) => row.session_id === session && (!since || row.ts > since)).sort((a, b) => a.ts.localeCompare(b.ts));
+}
+function fillEvidence(record, rows, root) {
+  const filled = { commands: 0, failure: null, files: 0, recheck: null };
+  const commands = rows.filter((r) => r.tool === "Bash" && r.command).map((r) => r.command);
+  const failed = record.outcome.status === "abandoned" ? rows.filter((r) => r.tool === "Bash" && r.ok === false && r.command).at(-1) : undefined;
+  const edited = editedFiles(rows, root);
+  let output = false, errors = false;
+  const detail = { ...record.detail ?? {} };
+  if (!detail.commands?.length && commands.length) {
+    detail.commands = commands.slice(-MAX_DETAIL_ITEMS);
+    filled.commands = detail.commands.length;
+  }
+  if (!detail.output && failed?.output) {
+    detail.output = `$ ${failed.command}
+${failed.output}`.slice(0, MAX_DETAIL_BYTES);
+    output = true;
+  }
+  if (Object.keys(detail).length)
+    record.detail = detail;
+  if (!record.outcome.errors?.length && failed) {
+    const last = errorLine(failed.output ?? "");
+    let error = `${failed.command}${last ? `: ${last}` : " failed"}`.slice(0, MAX_ERROR_BYTES);
+    while (Buffer.byteLength(error, "utf8") > MAX_ERROR_BYTES)
+      error = error.slice(0, -1);
+    record.outcome.errors = [error];
+    errors = true;
+  }
+  if (record.outcome.status === "abandoned" && !record.outcome.recheck) {
+    const test = rows.filter((r) => r.tool === "Bash" && r.ok === false && r.command && runnable(r.command)).at(-1);
+    if (test) {
+      record.outcome.recheck = test.command.trim();
+      filled.recheck = record.outcome.recheck;
+    }
+  }
+  if (!record.delta?.files?.length && edited.length) {
+    record.delta = { ...record.delta ?? {}, files: edited.slice(0, 500) };
+    filled.files = edited.length;
+  }
+  fit2(record, filled, output);
+  if (output && record.detail?.output || errors)
+    filled.failure = failed.command;
+  return filled;
+}
+function fit2(record, filled, output) {
+  const over = () => Buffer.byteLength(canonical(record), "utf8") > MAX_RECORD_BYTES;
+  const detail = record.detail;
+  while (filled.commands && detail?.commands?.length && over()) {
+    detail.commands = detail.commands.slice(Math.ceil(detail.commands.length / 2));
+    filled.commands = detail.commands.length;
+    record.truncated = true;
+  }
+  while (output && detail?.output && (over() || Buffer.byteLength(detail.output, "utf8") > MAX_DETAIL_BYTES)) {
+    const half = Math.floor(detail.output.length / 2);
+    record.truncated = true;
+    if (half < 400) {
+      delete detail.output;
+      break;
+    }
+    detail.output = headTail(detail.output, half);
+  }
+  while (filled.files && record.delta?.files?.length && over()) {
+    record.delta.files = record.delta.files.slice(0, Math.floor(record.delta.files.length / 2));
+    filled.files = record.delta.files.length;
+    record.truncated = true;
+  }
+  if (detail?.commands?.length === 0)
+    delete detail.commands;
+  if (record.delta?.files?.length === 0)
+    delete record.delta.files;
+}
+
+// protocol/handoff.ts
+function recent(root, dir, since) {
+  const mentions = [...new Set([root, samePath(root)])].map((p) => JSON.stringify(p));
+  return captureRows(root, dir, lastDays(3), mentions).filter((row) => Date.parse(row.ts) >= since).sort((a, b) => a.ts.localeCompare(b.ts));
+}
+var ago = (ms) => {
+  const m = Math.round(ms / 60000);
+  if (m < 1)
+    return "just now";
+  if (m < 60)
+    return `${m} min ago`;
+  const h = Math.round(m / 60);
+  return `${h} hour${h === 1 ? "" : "s"} ago`;
+};
+function handoff(root, current, opts = {}) {
+  const now = Date.now();
+  const rows = recent(root, opts.captureDir, now - 24 * 3600000).filter((r) => r.session_id && r.session_id !== current);
+  if (!rows.length)
+    return null;
+  const last = rows.at(-1);
+  const session = last.session_id;
+  const mine = rows.filter((r) => r.session_id === session);
+  const agent = AGENT_NAMES[last.agent ?? "claude-code"] ?? last.agent ?? "An agent";
+  const edited = editedFiles(mine, root);
+  const failed = mine.filter((r) => r.tool === "Bash" && r.ok === false && !onlyLooks(r.command ?? "")).at(-1);
+  const record = opts.db?.prepare(`SELECT intent, status FROM records WHERE run_id = ? AND TRIM(intent) != '' AND result IS NULL ORDER BY ts DESC LIMIT 1`).get(session);
+  if (!edited.length && !failed && !record)
+    return null;
+  const dirty = new Set((gitOrNull(root, ["status", "--porcelain"]) ?? "").split(`
+`).map((l) => l.slice(3).trim()).filter(Boolean));
+  const open = edited.filter((f) => dirty.has(f)).length;
+  const lines = [`Before this session, ${agent} worked in this repository (${ago(now - Date.parse(last.ts))}).`];
+  lines.push(record ? `  Last recorded: "${record.intent.replace(/\s+/g, " ").slice(0, 120)}" (${record.status})` : "  It recorded nothing, so this is all that is known.");
+  if (edited.length) {
+    const shown = edited.slice(0, 4).join(", ") + (edited.length > 4 ? ` and ${edited.length - 4} more` : "");
+    lines.push(`  Changed: ${shown}${open ? `; ${open === edited.length ? "all" : open} still uncommitted` : ""}`);
+  }
+  if (failed?.command) {
+    const why = errorLine(failed.output ?? "");
+    lines.push(`  Last failure: \`${failed.command.slice(0, 100)}\`${why ? ` \u2192 ${why.slice(0, 120)}` : ""}`);
+  }
+  const transcript = mine.map((r) => r.transcript).filter(Boolean).at(-1);
+  if (transcript)
+    lines.push(`  Its full session, if you need more: ${transcript}`);
+  return lines.join(`
+`);
+}
+var capturedEdits = (root, session) => editedFiles(recent(root, undefined, Date.now() - 2 * 86400000).filter((r) => r.session_id === session), root);
+
+// protocol/keep.ts
+import { createHash as createHash5 } from "crypto";
+import { appendFileSync as appendFileSync3, closeSync as closeSync4, existsSync as existsSync6, mkdirSync as mkdirSync10, openSync as openSync4, readFileSync as readFileSync6, readdirSync as readdirSync3, readSync as readSync4, renameSync as renameSync2, rmSync as rmSync4, statSync as statSync5, truncateSync, writeFileSync as writeFileSync8 } from "fs";
+import { homedir as homedir7 } from "os";
+import { basename as basename3, join as join12 } from "path";
+import { constants as constants2, gunzipSync } from "zlib";
+var keptRoot = () => process.env.ANVC_KEPT_DIR ?? join12(homedir7(), ".anvc", "transcripts");
+var THROTTLE_MS = 5 * 60000;
+function destination(repo, agent, session, source, root) {
+  const safe = session.replace(/[^\w.-]/g, "-");
+  return join12(root, repoKey(repo), agent, source.endsWith(".zst") ? `${safe}.jsonl.zst` : `${safe}.jsonl.gz`);
+}
+function keepSession(repo, agent, session, source, opts = {}) {
+  const root = opts.root ?? keptRoot();
+  try {
+    if (!session || !source || !existsSync6(source))
+      return null;
+    if (readPolicy(repo).fields.transcripts === "off")
+      return null;
+    const dest = destination(repo, agent, session, source, root);
+    if (existsSync6(dest)) {
+      const copied = statSync5(dest).mtimeMs;
+      if (copied >= statSync5(source).mtimeMs)
+        return dest;
+      if (!opts.force && Date.now() - copied < THROTTLE_MS)
+        return dest;
+    }
+    mkdirSync10(join12(dest, ".."), { recursive: true, mode: 448 });
+    if (dest.endsWith(".gz") && appendNew(source, dest))
+      return dest;
+    rmSync4(markOf(dest), { force: true });
+    const raw = readFileSync6(source);
+    const body = dest.endsWith(".gz") ? Bun.gzipSync(raw) : raw;
+    const tmp = `${dest}.tmp`;
+    writeFileSync8(tmp, body, { mode: 384 });
+    renameSync2(tmp, dest);
+    if (dest.endsWith(".gz"))
+      mark(dest, raw.length, raw);
+    return dest;
+  } catch {
+    return null;
+  }
+}
+var markOf = (dest) => `${dest}.at`;
+var TAIL = 4096;
+var hash = (bytes) => createHash5("sha256").update(bytes).digest("hex");
+function mark(dest, source, tail) {
+  writeJson(markOf(dest), { source, copy: statSync5(dest).size, tail: hash(tail.subarray(Math.max(0, tail.length - TAIL))) });
+}
+function appendNew(source, dest) {
+  const at = readJson(markOf(dest), null);
+  if (!at || !existsSync6(dest))
+    return false;
+  const size = statSync5(source).size;
+  const copy = statSync5(dest).size;
+  if (size < at.source || copy < at.copy)
+    return false;
+  const from = Math.max(0, at.source - TAIL);
+  const read = Buffer.alloc(size - from);
+  const fd = openSync4(source, "r");
+  try {
+    readSync4(fd, read, 0, read.length, from);
+  } finally {
+    closeSync4(fd);
+  }
+  const before = read.subarray(0, at.source - from);
+  if (hash(before) !== at.tail)
+    return false;
+  const added = read.subarray(at.source - from);
+  if (copy > at.copy)
+    truncateSync(dest, at.copy);
+  if (added.length)
+    appendFileSync3(dest, Bun.gzipSync(added));
+  mark(dest, size, read);
+  return true;
+}
+function readKept(path) {
+  try {
+    const raw = readFileSync6(path);
+    if (path.endsWith(".gz"))
+      return gunzipSync(raw, { finishFlush: constants2.Z_SYNC_FLUSH }).toString("utf8");
+    if (path.endsWith(".jsonl"))
+      return raw.toString("utf8");
+    return null;
+  } catch {
+    return null;
+  }
+}
+function keptSessions(repo, root = keptRoot()) {
+  const out = [];
+  for (const base of [join12(root, repoKey(repo)), join12(root, legacyKey(repo))]) {
+    let agents = [];
+    try {
+      agents = readdirSync3(base);
+    } catch {
+      continue;
+    }
+    for (const agent of agents) {
+      let names = [];
+      try {
+        names = readdirSync3(join12(base, agent));
+      } catch {
+        continue;
+      }
+      for (const name of names) {
+        if (!/\.jsonl(\.gz|\.zst)?$/.test(name))
+          continue;
+        const path = join12(base, agent, name);
+        try {
+          out.push({ agent, session: basename3(name).replace(/\.jsonl(\.gz|\.zst)?$/, ""), path, bytes: statSync5(path).size });
+        } catch {}
+      }
+    }
+  }
+  return out;
+}
+
+// protocol/backfill.ts
+import { existsSync as existsSync8, readdirSync as readdirSync4, readFileSync as readFileSync8, statSync as statSync6 } from "fs";
+import { isAbsolute as isAbsolute5, join as join14 } from "path";
+import { fileURLToPath } from "url";
+
+// protocol/ingest.ts
+import { existsSync as existsSync7, readFileSync as readFileSync7 } from "fs";
+import { isAbsolute as isAbsolute4, join as join13 } from "path";
+var DELEGATE_TOOLS = new Set(["Task", "Agent"]);
+function readCapture(path) {
+  return readFileSync7(path, "utf8").trim().split(`
+`).filter(Boolean).map((line) => JSON.parse(line)).filter((e) => e.anvc_capture === 0);
+}
+function uncommitted(repo) {
+  const changed = gitOrNull(repo, ["diff", "--name-only", "-z", "HEAD"]) ?? "";
+  const added = gitOrNull(repo, ["ls-files", "--others", "--exclude-standard", "-z"]) ?? "";
+  return new Set(`${changed}\x00${added}`.split("\x00").filter(Boolean));
+}
+function toRecords(events, repo, checkpoints = new Map, opts = {}) {
+  const bySession = Map.groupBy(events.filter((e) => e.session_id), (e) => e.session_id);
+  const turns = [];
+  for (const stream of bySession.values()) {
+    stream.sort((a, b) => a.ts.localeCompare(b.ts));
+    let current = [];
+    for (const event of stream) {
+      if (event.event === "UserPromptSubmit" && current.length) {
+        turns.push({ events: current, until: Date.parse(event.ts) });
+        current = [];
+      }
+      current.push(event);
+    }
+    if (current.length)
+      turns.push({ events: current, until: Infinity });
+  }
+  const head = gitOrNull(repo, ["rev-parse", "HEAD"]);
+  const dirty = uncommitted(repo);
+  const toRepo = inRepo(repo);
+  const records = [];
+  for (const { events: turn, until } of turns) {
+    const prompt = turn.find((e) => e.prompt)?.prompt;
+    if (!prompt)
+      continue;
+    const session = turn[0].session_id;
+    const from = Date.parse(turn[0].ts);
+    if (checkpoints.get(session)?.some((t) => t >= from && t < until))
+      continue;
+    const actions = [];
+    const written = new Set;
+    const guessed = new Set;
+    const failures = [];
+    const delegations = [];
+    const outputs = [];
+    for (const event of turn) {
+      if (event.tool && DELEGATE_TOOLS.has(event.tool) && event.delegated) {
+        delegations.push(event.agent_type ? `${event.delegated} (${event.agent_type})` : event.delegated);
+        continue;
+      }
+      if (event.tool === "Read" && event.path)
+        actions.push({ kind: "read", path: event.path, ts: event.ts });
+      else if (event.path && (event.tool === "Edit" || event.tool === "Write" || event.tool === "NotebookEdit")) {
+        actions.push({ kind: "write", path: event.path, bytes: event.bytes ?? undefined, ts: event.ts });
+        written.add(event.path);
+      } else if (event.tool === "Bash" && event.command) {
+        actions.push({ kind: "shell", command: event.command.slice(0, 512), ts: event.ts });
+        if (event.ok === false) {
+          failures.push(`failed: ${event.command.slice(0, 200)}`);
+          if (event.output)
+            outputs.push(`$ ${event.command.slice(0, 200)}
+${event.output}`);
+        }
+        const moved = /(^|[;&|]\s*)cd\s/.test(event.command);
+        for (const { path, kind } of shellPaths(event.command)) {
+          if (moved && !isAbsolute4(path))
+            continue;
+          const absolute = isAbsolute4(path) ? path : join13(event.cwd, path);
+          actions.push({ kind, path: absolute, ts: event.ts });
+          if (kind === "write") {
+            written.add(absolute);
+            guessed.add(absolute);
+          }
+        }
+      }
+    }
+    const relative = [...new Set([...written].map((p) => [p, toRepo(p)]).filter(([p, rel]) => rel !== null && (!guessed.has(p) || existsSync7(p) || gitOrNull(repo, ["log", "-1", "--format=%H", "--all", "--", rel]))).map(([, rel]) => rel))];
+    const abandoned = relative.length > 0 && (opts.fresh ? relative.every((p) => !dirty.has(p) && !gitOrNull(repo, ["log", "-1", "--format=%H", `--since=${turn[0].ts}`, "--", p])) : relative.every((p) => dirty.has(p)));
+    if (!relative.length && !failures.length && !delegations.length)
+      continue;
+    records.push({
+      anvc: 0,
+      id: contentUlid([session, turn[0].ts, prompt], new Date(turn[0].ts).getTime()),
+      anchor: head ? { kind: "commit", oid: head } : { kind: "blob", oid: "0".repeat(40) },
+      session: { agent: turn[0].agent ?? "claude-code", run_id: session },
+      intent: delegations.length ? { goal: `Delegated: ${delegations.join("; ")}`.slice(0, 200) } : {},
+      actions: actions.slice(0, 1000),
+      delta: relative.length ? { files: relative } : undefined,
+      outcome: {
+        status: abandoned ? "abandoned" : "kept",
+        ...failures.length ? { errors: failures.slice(0, 20) } : {},
+        ...abandoned && delegations.length ? { recheck: null } : {}
+      },
+      ...outputs.length ? { detail: { output: headTail(outputs.join(`
+
+`), 24 * 1024) } } : {},
+      ts: turn.at(-1).ts,
+      ...actions.length > 1000 ? { truncated: true } : {}
+    });
+  }
+  return records;
+}
+function fit3(record) {
+  const size = (r) => Buffer.byteLength(canonical(r), "utf8");
+  if (size(record) <= MAX_RECORD_BYTES)
+    return record;
+  const trimmed = { ...record, truncated: true };
+  while (trimmed.detail?.output && size(trimmed) > MAX_RECORD_BYTES) {
+    const half = Math.floor(trimmed.detail.output.length / 2);
+    if (half < 400) {
+      trimmed.detail = { ...trimmed.detail, output: undefined };
+      break;
+    }
+    trimmed.detail = { ...trimmed.detail, output: headTail(trimmed.detail.output, half) };
+  }
+  while (trimmed.actions?.length && size(trimmed) > MAX_RECORD_BYTES) {
+    trimmed.actions = trimmed.actions.slice(0, Math.floor(trimmed.actions.length / 2));
+  }
+  if (size(trimmed) > MAX_RECORD_BYTES)
+    trimmed.actions = [];
+  return trimmed;
+}
+function ingest(repo, events, opts = {}) {
+  const here = isRepo(repo);
+  const forRepo = events.filter((e) => here(e.repo));
+  const stored = new Set;
+  const checkpoints = new Map;
+  for (const [, r] of readRecords(repo)) {
+    stored.add(r.id);
+    if (typeof r.intent.goal === "string") {
+      (checkpoints.get(r.session.run_id) ?? checkpoints.set(r.session.run_id, []).get(r.session.run_id)).push(Date.parse(r.ts));
+    }
+  }
+  const records = toRecords(forRepo, repo, checkpoints, { fresh: opts.fresh });
+  let written = 0, skipped = 0;
+  const failed = [], ids = [];
+  const seen = new Set;
+  for (const record of records) {
+    if (stored.has(record.id) || seen.has(record.id)) {
+      skipped++;
+      continue;
+    }
+    seen.add(record.id);
+    try {
+      appendRecord(repo, fit3(record), { tier: "private" });
+      written++;
+      ids.push(record.id);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (message.includes("Refusing to overwrite"))
+        skipped++;
+      else
+        failed.push(`${record.id}: ${message}`);
+    }
+  }
+  return { written, skipped, failed, ids };
+}
+
+// protocol/backfill.ts
+function transcriptDir(repo, root = join14(claudeDir(), "projects")) {
+  return join14(root, repo.replace(/[\\/:_]/g, "-"));
+}
+function readOr(path, text) {
+  if (text !== undefined)
+    return text;
+  try {
+    return readFileSync8(path, "utf8");
+  } catch {
+    return null;
+  }
+}
+function readTranscript(path, scrub, seen, text) {
+  const raw = readOr(path, text);
+  if (raw === null)
+    return [];
+  const lines = [];
+  for (const line of raw.split(`
+`)) {
+    if (!line.trim())
+      continue;
+    try {
+      lines.push(JSON.parse(line));
+    } catch {}
+  }
+  const results = new Map;
+  for (const line of lines) {
+    if (line.type !== "user" || !Array.isArray(line.message?.content))
+      continue;
+    for (const block of line.message.content) {
+      if (block.type !== "tool_result" || !block.tool_use_id)
+        continue;
+      results.set(block.tool_use_id, {
+        ok: !block.is_error,
+        output: textOf(block.content)
+      });
+    }
+  }
+  const events = [];
+  for (const line of lines) {
+    const ts = line.timestamp;
+    const session = line.sessionId ?? null;
+    const cwd = line.cwd ?? "";
+    if (!ts)
+      continue;
+    if (line.type === "user" && typeof line.message?.content === "string") {
+      const text = line.message.content.trim();
+      if (!text || /^<(task-notification|system-reminder|local-command|command-)/.test(text))
+        continue;
+      if (line.uuid && seen) {
+        if (seen.has(line.uuid))
+          continue;
+        seen.add(line.uuid);
+      }
+      events.push({
+        anvc_capture: 0,
+        event: "UserPromptSubmit",
+        ts,
+        session_id: session,
+        cwd,
+        repo: null,
+        tool: null,
+        path: null,
+        bytes: null,
+        command: null,
+        prompt: scrub(text).slice(0, 8192),
+        ok: null
+      });
+      continue;
+    }
+    if (line.type !== "assistant" || !Array.isArray(line.message?.content))
+      continue;
+    for (const block of line.message.content) {
+      if (block.type !== "tool_use" || !block.name)
+        continue;
+      const key = `${line.uuid ?? ""}|${block.id ?? ""}`;
+      if (line.uuid && seen) {
+        if (seen.has(key))
+          continue;
+        seen.add(key);
+      }
+      const input = block.input ?? {};
+      const result = block.tool_use_id ? undefined : results.get(String(block.id ?? ""));
+      const path = input.file_path ?? input.path ?? input.notebook_path;
+      const command = typeof input.command === "string" ? input.command : null;
+      events.push({
+        anvc_capture: 0,
+        event: "PostToolUse",
+        ts,
+        session_id: session,
+        cwd,
+        repo: null,
+        tool: block.name,
+        path: path ? String(path) : null,
+        bytes: typeof input.content === "string" ? input.content.length : typeof input.new_string === "string" ? input.new_string.length : null,
+        command: command ? scrub(command).slice(0, 512) : null,
+        prompt: null,
+        ok: result ? result.ok : null,
+        output: result?.output ? keepOutput(result.output, scrub) : null,
+        delegated: DELEGATE_TOOLS.has(block.name) && typeof input.description === "string" ? scrub(String(input.description)).slice(0, 200) : null,
+        agent_type: DELEGATE_TOOLS.has(block.name) && typeof input.subagent_type === "string" ? String(input.subagent_type).slice(0, 64) : null
+      });
+    }
+  }
+  return events;
+}
+function codexSessions(root = join14(codexDir(), "sessions")) {
+  const out = [];
+  const walk = (dir) => {
+    let names = [];
+    try {
+      names = readdirSync4(dir);
+    } catch {
+      return;
+    }
+    for (const name of names) {
+      const full = join14(dir, name);
+      if (name.endsWith(".jsonl") && name.startsWith("rollout-"))
+        out.push(full);
+      else if (/^\d+$/.test(name))
+        walk(full);
+    }
+  };
+  walk(root);
+  return out.sort();
+}
+function codexMeta(path) {
+  try {
+    const head = readHead(path, 256 * 1024) ?? "";
+    const first = (head.includes(`
+`) ? head : readFileSync8(path, "utf8")).split(`
+`, 1)[0] ?? "";
+    const row = JSON.parse(first);
+    if (row.type !== "session_meta")
+      return { id: null, cwd: null };
+    return {
+      id: typeof row.payload?.id === "string" ? row.payload.id : null,
+      cwd: typeof row.payload?.cwd === "string" ? pathOf(row.payload.cwd) : null
+    };
+  } catch {
+    return { id: null, cwd: null };
+  }
+}
+function sessionFiles(repo, opts = {}) {
+  const out = [];
+  const dir = transcriptDir(repo, opts.root);
+  try {
+    for (const name of readdirSync4(dir)) {
+      if (name.endsWith(".jsonl"))
+        out.push({ agent: "claude-code", session: name.slice(0, -6), path: join14(dir, name) });
+    }
+  } catch {}
+  for (const path of codexSessions(opts.codexRoot)) {
+    const meta = codexMeta(path);
+    if (meta.id && meta.cwd && repoOf(meta.cwd, repo))
+      out.push({ agent: "codex", session: meta.id, path });
+  }
+  for (const { session, path } of cursorSessions(repo))
+    out.push({ agent: "cursor", session, path });
+  return out;
+}
+function readCodexSession(path, scrub, text) {
+  const raw = readOr(path, text);
+  if (raw === null)
+    return [];
+  let session = null;
+  let cwd = "";
+  const events = [];
+  const done = new Set;
+  let lastPrompt = "";
+  const base = (ts) => ({
+    anvc_capture: 0,
+    ts,
+    session_id: session,
+    agent: "codex",
+    cwd,
+    repo: null,
+    tool: null,
+    path: null,
+    bytes: null,
+    command: null,
+    prompt: null,
+    ok: null
+  });
+  const once = (id) => {
+    if (typeof id !== "string")
+      return true;
+    if (done.has(id))
+      return false;
+    done.add(id);
+    return true;
+  };
+  const prompt = (ts, text) => {
+    const t = text.trim();
+    if (!t || t === lastPrompt)
+      return;
+    lastPrompt = t;
+    events.push({ ...base(ts), event: "UserPromptSubmit", prompt: scrub(t).slice(0, 8192) });
+  };
+  const command = (ts, c) => {
+    const cmd = Array.isArray(c.command) ? c.command.map(String).join(" ") : typeof c.command === "string" ? c.command : "";
+    const output = [c.stdout, c.stderr].filter((x) => typeof x === "string" && x.length > 0).join(`
+`) || (typeof c.aggregated_output === "string" ? c.aggregated_output : "");
+    events.push({
+      ...base(ts),
+      event: "PostToolUse",
+      tool: "Bash",
+      cwd: typeof c.cwd === "string" ? pathOf(c.cwd) : cwd,
+      command: cmd ? scrub(cmd).slice(0, 512) : null,
+      ok: typeof c.exit_code === "number" ? c.exit_code === 0 : null,
+      output: output ? keepOutput(output, scrub) : null
+    });
+  };
+  const change = (ts, changes, ok) => {
+    const files = Array.isArray(changes) ? changes.map((c) => c?.path).filter((x) => typeof x === "string") : changes && typeof changes === "object" ? Object.keys(changes) : [];
+    for (const file of files) {
+      events.push({ ...base(ts), event: "PostToolUse", tool: "Edit", path: isAbsolute5(file) ? file : join14(cwd, file), ok });
+    }
+  };
+  for (const line of raw.split(`
+`)) {
+    if (!line.trim())
+      continue;
+    let row;
+    try {
+      row = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    const p = row.payload ?? {};
+    const ts = row.timestamp;
+    if (row.type === "session_meta") {
+      session = typeof p.id === "string" ? p.id : session;
+      cwd = typeof p.cwd === "string" ? pathOf(p.cwd) : cwd;
+      continue;
+    }
+    if (row.type === "turn_context" && typeof p.cwd === "string") {
+      cwd = pathOf(p.cwd);
+      continue;
+    }
+    if (row.type !== "event_msg" || !ts)
+      continue;
+    if (p.type === "item_completed" && p.item && typeof p.item === "object") {
+      const item = p.item;
+      if (!once(item.id))
+        continue;
+      if (item.type === "UserMessage")
+        prompt(ts, textOf(item.content));
+      else if (item.type === "CommandExecution")
+        command(ts, item);
+      else if (item.type === "FileChange")
+        change(ts, item.changes, item.status !== "failed");
+    } else if (p.type === "user_message" && typeof p.message === "string") {
+      prompt(ts, p.message);
+    } else if (p.type === "exec_command_end") {
+      if (once(p.call_id))
+        command(ts, p);
+    } else if (p.type === "patch_apply_end") {
+      if (once(p.call_id))
+        change(ts, p.changes, typeof p.success === "boolean" ? p.success : true);
+    } else if (p.type === "task_complete") {
+      events.push({ ...base(ts), event: "Stop" });
+    }
+  }
+  return events;
+}
+function pathOf(where) {
+  if (!where.startsWith("file://"))
+    return where;
+  try {
+    return fileURLToPath(where);
+  } catch {
+    return where.slice(7);
+  }
+}
+function textOf(content) {
+  if (typeof content === "string")
+    return content;
+  if (!Array.isArray(content))
+    return "";
+  return content.map((c) => typeof c === "string" ? c : typeof c?.text === "string" ? c.text : "").filter(Boolean).join(`
+`);
+}
+function cursorSessions(repo, root = join14(cursorDir(), "projects")) {
+  const dir = join14(root, repo.replace(/^\/+/, "").replace(/[\\/:_]/g, "-"), "agent-transcripts");
+  const out = [];
+  let ids = [];
+  try {
+    ids = readdirSync4(dir);
+  } catch {
+    return out;
+  }
+  for (const id of ids) {
+    const path = join14(dir, id, `${id}.jsonl`);
+    try {
+      statSync6(path);
+      out.push({ session: id, path });
+    } catch {}
+  }
+  return out;
+}
+function cursorElsewhere(path, repo, text) {
+  const raw = readOr(path, text);
+  if (raw === null)
+    return false;
+  const seen = [...raw.matchAll(/"(?:path|file_path|target_file|targetDirectory|workingDirectory)"\s*:\s*"(\/[^"]+)"/g)].map((m) => m[1]);
+  return seen.length > 0 && !seen.some((p) => within(p, repo));
+}
+function readCursorSession(path, session, repo, scrub, text) {
+  const raw = readOr(path, text);
+  if (raw === null)
+    return [];
+  let end = Date.now();
+  try {
+    end = statSync6(path).mtimeMs;
+  } catch {}
+  const lines = raw.split(`
+`).filter((l) => l.trim());
+  const events = [];
+  lines.forEach((line, i) => {
+    let row;
+    try {
+      row = JSON.parse(line);
+    } catch {
+      return;
+    }
+    const ts = new Date(end - (lines.length - i) * 1000).toISOString();
+    const base = {
+      anvc_capture: 0,
+      ts,
+      session_id: session,
+      agent: "cursor",
+      cwd: repo,
+      repo: null,
+      tool: null,
+      path: null,
+      bytes: null,
+      command: null,
+      prompt: null,
+      ok: null
+    };
+    const content = Array.isArray(row.message?.content) ? row.message.content : [];
+    if (row.role === "user") {
+      const text = content.map((b) => typeof b.text === "string" ? b.text : "").join(`
+`);
+      const said = (/<user_query>\s*([\s\S]*?)\s*<\/user_query>/.exec(text)?.[1] ?? text).trim();
+      if (said)
+        events.push({ ...base, event: "UserPromptSubmit", prompt: scrub(said).slice(0, 8192) });
+      return;
+    }
+    for (const block of content) {
+      if (block.type !== "tool_use")
+        continue;
+      const call = toolCall(block.name, block.input ?? {});
+      if (!call.tool)
+        continue;
+      events.push({
+        ...base,
+        event: "PostToolUse",
+        tool: call.tool,
+        path: call.paths[0] ? isAbsolute5(call.paths[0]) ? call.paths[0] : join14(repo, call.paths[0]) : null,
+        command: call.command ? scrub(call.command).slice(0, 512) : null,
+        bytes: call.bytes
+      });
+    }
+  });
+  return events;
+}
+function missingCursorPrompts(transcript, session, repo, rows, scrub) {
+  const mine = rows.filter((r) => r.session_id === session);
+  if (mine.some((r) => r.event === "UserPromptSubmit"))
+    return [];
+  const prompts = readCursorSession(transcript, session, repo, scrub).filter((e) => e.event === "UserPromptSubmit");
+  const first = mine.map((r) => Date.parse(String(r.ts))).filter((t) => !Number.isNaN(t)).sort((a, b) => a - b)[0];
+  return prompts.map((e, i) => ({
+    ...e,
+    repo,
+    ts: first === undefined ? e.ts : new Date(first - (prompts.length - i)).toISOString()
+  }));
+}
+function repoOf(cwd, repo) {
+  if (!within(cwd, repo))
+    return null;
+  if (cwd === repo || !existsSync8(cwd))
+    return repo;
+  let nearest = nearestRepo.get(cwd);
+  if (nearest === undefined)
+    nearestRepo.set(cwd, nearest = repoRoot(cwd));
+  return nearest === null || isRepo(repo)(nearest) ? repo : null;
+}
+var nearestRepo = new Map;
+var within = (path, repo) => path === repo || path.startsWith(`${repo}/`) || isRepo(repo)(path) || inRepo(repo)(path) !== null;
+function backfill(repo, opts = {}) {
+  const dir = transcriptDir(repo, opts.root);
+  const scrub2 = opts.scrub ?? scrub;
+  let names = [];
+  try {
+    names = readdirSync4(dir).filter((n) => n.endsWith(".jsonl"));
+  } catch {}
+  const events = [];
+  let files = 0;
+  const take = (batch) => {
+    const mine = batch.filter((e) => !opts.since || e.ts >= opts.since).map((e) => ({ ...e, repo: repoOf(e.cwd, repo) })).filter((e) => e.repo);
+    if (!mine.length)
+      return;
+    files++;
+    events.push(...mine);
+  };
+  for (const full of codexSessions(opts.codexRoot)) {
+    const where = codexMeta(full).cwd;
+    if (where && repoOf(where, repo))
+      take(readCodexSession(full, scrub2));
+  }
+  for (const { session, path } of cursorSessions(repo, opts.cursorRoot)) {
+    if (!cursorElsewhere(path, repo))
+      take(readCursorSession(path, session, repo, scrub2));
+  }
+  const seen = new Set;
+  for (const name of names)
+    take(readTranscript(join14(dir, name), scrub2, seen));
+  const read = new Set(events.map((e) => e.session_id));
+  for (const kept of keptSessions(repo, opts.keptRoot)) {
+    if (read.has(kept.session))
+      continue;
+    const text = readKept(kept.path);
+    if (!text)
+      continue;
+    if (kept.agent === "cursor" && cursorElsewhere(kept.path, repo, text))
+      continue;
+    take(kept.agent === "codex" ? readCodexSession(kept.path, scrub2, text) : kept.agent === "cursor" ? readCursorSession(kept.path, kept.session, repo, scrub2, text) : readTranscript(kept.path, scrub2, seen, text).map((e) => ({ ...e, agent: kept.agent })));
+  }
+  events.sort((a, b) => a.ts.localeCompare(b.ts));
+  return {
+    events,
+    sessions: new Set(events.map((e) => e.session_id).filter(Boolean)).size,
+    files,
+    from: events[0]?.ts ?? null,
+    to: events.at(-1)?.ts ?? null
+  };
+}
+
+// protocol/autosave.ts
+import { mkdirSync as mkdirSync11, writeFileSync as writeFileSync9 } from "fs";
+import { join as join15 } from "path";
+var QUIET_MS = 30 * 60000;
+var DAYS = 3;
+var doneFile = (repo) => join15(stateRoot(), `autosaved-${repoKey(repo)}.json`);
+function autosave(repo, opts = {}) {
+  const now = Date.now();
+  const rows = captureRows(repo, undefined, lastDays(DAYS, now)).filter((row) => row.anvc_capture === 0 && row.session_id);
+  const done = readJson(doneFile(repo), {});
+  const ready = [...Map.groupBy(rows, (row) => row.session_id)].map(([session, list]) => ({ session, list, last: list.reduce((m, e) => e.ts > m ? e.ts : m, "") })).filter(({ session, last }) => {
+    if (done[session] && done[session] >= last)
+      return false;
+    if (opts.session)
+      return session === opts.session;
+    return session !== opts.except && now - Date.parse(last) >= QUIET_MS;
+  });
+  if (!ready.length)
+    return [];
+  const lastRecorded = new Map;
+  for (const [, r] of readRecords(repo)) {
+    if (typeof r.intent.goal !== "string")
+      continue;
+    const at = lastRecorded.get(r.session.run_id);
+    if (!at || r.ts > at)
+      lastRecorded.set(r.session.run_id, r.ts);
+  }
+  const saved = [];
+  for (const { session, list, last } of ready) {
+    const after = lastRecorded.get(session);
+    const { ids, failed } = ingest(repo, after ? list.filter((e) => e.ts > after) : list, { fresh: true });
+    if (ids.length)
+      logActivity({ kind: "autosaved", repo, session, records: ids });
+    saved.push(...ids);
+    if (!failed.length) {
+      done[session] = last;
+      continue;
+    }
+    logActivity({
+      kind: "autosaved",
+      repo,
+      session,
+      outcome: "failed",
+      records: failed.map((f) => f.slice(0, f.indexOf(": "))),
+      titles: failed.map((f) => f.slice(f.indexOf(": ") + 2))
+    });
+  }
+  const cutoff = new Date(now - (DAYS + 1) * 86400000).toISOString();
+  for (const [session, ts] of Object.entries(done))
+    if (ts < cutoff)
+      delete done[session];
+  try {
+    mkdirSync11(stateRoot(), { recursive: true });
+    writeFileSync9(doneFile(repo), JSON.stringify(done));
+  } catch {}
+  return saved;
+}
+
+// protocol/absorb.ts
+import { spawn as spawn2, spawnSync as spawnSync3 } from "child_process";
+import { existsSync as existsSync10, mkdtempSync as mkdtempSync2, readFileSync as readFileSync10, rmSync as rmSync6, statSync as statSync8, writeFileSync as writeFileSync11 } from "fs";
+import { tmpdir as tmpdir2 } from "os";
+import { basename as basename5, join as join17 } from "path";
+
 // protocol/goals.ts
+import { existsSync as existsSync9, mkdirSync as mkdirSync12, rmSync as rmSync5, writeFileSync as writeFileSync10 } from "fs";
+import { dirname as dirname8 } from "path";
 var GOAL_LABELS = { todo: "To do", doing: "In progress", done: "Done", dropped: "Dropped" };
 var approvalOn = (repo) => {
   const path = marker(repo, "approve-goals");
@@ -5877,7 +5964,7 @@ function firstLine(text) {
   return line.length > 120 ? `${line.slice(0, 119)}\u2026` : line;
 }
 var fromItem = (i) => ({ title: i.title, source: "item", item: i.id, goal: i.goal, subagent: null, session: i.session, since: i.since, from: i.from });
-function working(root, items, now) {
+function working(root, items, now, db) {
   const rows = captureRows(root, undefined, lastDays(2, now)).filter((r) => r.session_id).sort((a, b) => a.ts.localeCompare(b.ts));
   const doing = items.filter((i) => i.state === "doing").sort((a, b) => b.since.localeCompare(a.since));
   const out = [];
@@ -5897,9 +5984,11 @@ function working(root, items, now) {
     }
     if (!mine.length) {
       const asked = list.findLast((r) => r.prompt && !INSERTED.test(r.prompt.trimStart()));
+      const goal = asked && db ? db.prepare(`SELECT intent FROM records WHERE run_id = ? AND ts > ? AND intent_source = 'authored' AND result IS NULL
+        ORDER BY ts DESC LIMIT 1`).get(session, asked.ts)?.intent : undefined;
       out.push({
-        title: asked ? firstLine(asked.prompt) : null,
-        source: asked ? "prompt" : null,
+        title: goal ? firstLine(goal) : asked ? firstLine(asked.prompt) : null,
+        source: goal ? "goal" : asked ? "prompt" : null,
         item: null,
         goal: null,
         agent,
@@ -6040,7 +6129,7 @@ function readStatus(repo, index) {
   const read = (db, records) => {
     const items = readItems(records);
     return {
-      now: working(root, items, now),
+      now: working(root, items, now, db),
       done: finished(db, root, items),
       next: upNext(items),
       goals: Object.fromEntries(allGoals(readGoals(db)).map((g) => [g.id, g.from ? `"${g.title}" (from ${g.from})` : g.title]))
